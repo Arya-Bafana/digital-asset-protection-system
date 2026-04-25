@@ -772,7 +772,7 @@ export default function App() {
             <div style={{ background: 'rgba(34,197,94,0.08)', border: '1px solid rgba(34,197,94,0.2)', borderRadius: 10, padding: '12px 16px', marginBottom: 18 }}>
               <div style={{ fontWeight: 700, fontSize: 13, color: COLORS.greenLight, marginBottom: 3 }}>📌 WHAT THIS DOES</div>
               <div style={{ fontSize: 12, color: COLORS.muted, lineHeight: 1.6 }}>
-                Upload your original content here to register its digital fingerprint. Sports Guardian generates pHash + dHash + aHash fingerprints — three independent digital IDs that identify your content even after editing, cropping, or color changes. Tell judges: <i>"This is how the broadcaster registers a clip before match day."</i>
+                Upload your original content here to register its digital fingerprint. Sports Guardian generates pHash + dHash + aHash fingerprints — three independent digital IDs that identify your content even after editing, cropping, or color changes. <i>"This is how the broadcaster registers a clip before match day."</i>
               </div>
             </div>
 
@@ -858,7 +858,7 @@ export default function App() {
         {tab === 'alerts' && (
           <div className="fade-in">
             <div style={{ background: 'rgba(239,68,68,0.06)', border: '1px solid rgba(239,68,68,0.2)', borderRadius: 10, padding: '10px 14px', marginBottom: 16, fontSize: 12, color: COLORS.muted }}>
-              <b style={{ color: COLORS.text }}>Note for demo:</b> These alerts simulate what Sports Guardian would find when scanning YouTube, Instagram, and Telegram for stolen sports clips. In a live system, these would be real results from platform API crawlers.
+              <b style={{ color: COLORS.text }}>Note:</b> These alerts simulate what Sports Guardian would find when scanning YouTube, Instagram, and Telegram for stolen sports clips. In a live system, these would be real results from platform API crawlers.
             </div>
             <div style={s.card}>
               <div style={s.cardHead}>
