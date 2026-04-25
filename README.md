@@ -3,7 +3,7 @@
 > Detect stolen sports clips in 8 seconds. Map the spread. Auto-generate DMCA takedowns.
 
 ## Live Demo
-🔗 https://digital-asset-protection-system-8m4s6yb1j.vercel.app
+https://sports-guardian-8b322.web.app
 
 ## The Problem
 Indian sports piracy causes ₹3,200 crore in losses per year. When Kohli hits a six, 2,400 Instagram reels steal the clip within 90 seconds. Tools like NexGuard and StegaWave cost ₹50 lakh/year — completely unaffordable for ISL clubs, kabaddi leagues, and state cricket boards.
