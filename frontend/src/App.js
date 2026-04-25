@@ -607,7 +607,7 @@ export default function App() {
             <div style={{ background: 'rgba(29,78,216,0.1)', border: '1px solid rgba(59,130,246,0.25)', borderRadius: 10, padding: '12px 16px', marginBottom: 18, display: 'flex', gap: 10, alignItems: 'flex-start' }}>
               <span style={{ fontSize: 18 }}>ℹ️</span>
               <div>
-                <div style={{ fontWeight: 700, fontSize: 13, color: '#93c5fd', marginBottom: 3 }}>HOW TO DEMO THIS TO JUDGES</div>
+                <div style={{ fontWeight: 700, fontSize: 13, color: '#93c5fd', marginBottom: 3 }}>Basic idea of Working</div>
                 <div style={{ fontSize: 12, color: COLORS.muted, lineHeight: 1.6 }}>
                   <b style={{ color: COLORS.text }}>Step 1:</b> Upload your original sports photo/video below (left box).<br />
                   <b style={{ color: COLORS.text }}>Step 2:</b> Open that image in any app → apply a filter, crop it, change brightness, or slow it down → save as a new file.<br />
