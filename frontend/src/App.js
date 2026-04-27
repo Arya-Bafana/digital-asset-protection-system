@@ -271,7 +271,8 @@ function HashMeter({ label, value, color }) {
 
 // ── DMCA Modal ──
 function DmcaModal({ result, origFile, suspFile, onClose }) {
-  const letter = `DMCA TAKEDOWN NOTICE
+  const downloadPDF = () => {
+    const content = `DMCA TAKEDOWN NOTICE
 Sports Guardian — Triple Hash Detection System
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -279,14 +280,14 @@ TO: Platform Trust & Safety Team
 RE: Unauthorized Sports Content
 
 INFRINGING CONTENT:
-• Original File: ${origFile?.name || 'Registered content'}
-• Suspected Copy: ${suspFile?.name || 'Detected content'}
-• Detection Confidence: ${result?.overall}%
-• pHash Similarity: ${result?.pSim}%
-• dHash Similarity: ${result?.dSim}%
-• aHash Similarity: ${result?.aSim}%
-• Detection Method: Triple Hash (pHash + dHash + aHash)
-• Status: ${result?.status}
+- Original File: ${origFile?.name || 'Registered content'}
+- Suspected Copy: ${suspFile?.name || 'Detected content'}
+- Detection Confidence: ${result?.overall}%
+- pHash Similarity: ${result?.pSim}%
+- dHash Similarity: ${result?.dSim}%
+- aHash Similarity: ${result?.aSim}%
+- Detection Method: Triple Hash (pHash + dHash + aHash)
+- Status: ${result?.status}
 
 I have a good faith belief that this content infringes on 
 the copyright of the registered content owner. I request 
@@ -295,6 +296,14 @@ immediate removal under the DMCA Section 512(c).
 — Sports Guardian Automated DMCA System
    Generated: ${new Date().toLocaleString()}`;
 
+    const blob = new Blob([content], { type: 'text/plain' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `DMCA_Notice_${Date.now()}.txt`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
   return (
     <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.75)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000, backdropFilter: 'blur(6px)' }}
       onClick={onClose}>
@@ -305,10 +314,14 @@ immediate removal under the DMCA Section 512(c).
           <button onClick={onClose} style={{ background: 'none', border: `1px solid ${COLORS.border}`, color: COLORS.muted, width: 30, height: 30, borderRadius: 6, cursor: 'pointer', fontSize: 16 }}>×</button>
         </div>
         <textarea readOnly value={letter} style={{ width: '100%', height: 260, background: 'rgba(0,0,0,0.3)', border: `1px solid ${COLORS.border}`, color: '#ccc', padding: 14, borderRadius: 8, fontFamily: 'monospace', fontSize: 11, resize: 'none', boxSizing: 'border-box' }} />
-        <div style={{ display: 'flex', gap: 10, marginTop: 14 }}>
+      <div style={{ display: 'flex', gap: 10, marginTop: 14 }}>
           <button onClick={() => navigator.clipboard.writeText(letter)}
             style={{ flex: 1, background: COLORS.green, color: '#fff', border: 'none', padding: '10px', borderRadius: 8, fontWeight: 700, fontSize: 12, letterSpacing: 1, cursor: 'pointer' }}>
             📋 COPY LETTER
+          </button>
+          <button onClick={downloadPDF}
+            style={{ flex: 1, background: COLORS.blue, color: '#fff', border: 'none', padding: '10px', borderRadius: 8, fontWeight: 700, fontSize: 12, letterSpacing: 1, cursor: 'pointer' }}>
+            ⬇️ DOWNLOAD
           </button>
           <button onClick={onClose} style={{ padding: '10px 18px', background: 'rgba(255,255,255,0.05)', border: `1px solid ${COLORS.border}`, color: COLORS.muted, borderRadius: 8, cursor: 'pointer' }}>CLOSE</button>
         </div>
