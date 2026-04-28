@@ -1,315 +1,216 @@
 import React, { useState, useRef, useCallback } from 'react';
 
 // ─────────────────────────────────────────────
-//  PERCEPTUAL HASHING — runs entirely in browser
+//  CONFIG
 // ─────────────────────────────────────────────
 
-async function getPixels(source, size) {
-  return new Promise((resolve) => {
-    const canvas = document.createElement('canvas');
-    canvas.width = size; canvas.height = size;
-    const ctx = canvas.getContext('2d');
-    const draw = (img) => {
-      ctx.drawImage(img, 0, 0, size, size);
-      const data = ctx.getImageData(0, 0, size, size).data;
-      const grey = [];
-      for (let i = 0; i < data.length; i += 4)
-        grey.push(0.299 * data[i] + 0.587 * data[i+1] + 0.114 * data[i+2]);
-      resolve(grey);
-    };
-    if (source instanceof HTMLVideoElement) { draw(source); }
-    else { const img = new Image(); img.onload = () => draw(img); img.src = source; }
-  });
-}
-
-async function computePHash(source) {
-  const size = 32;
-  const pixels = await getPixels(source, size);
-  const dct = [];
-  for (let u = 0; u < size; u++)
-    for (let v = 0; v < size; v++) {
-      let sum = 0;
-      for (let x = 0; x < size; x++)
-        for (let y = 0; y < size; y++)
-          sum += pixels[x*size+y] * Math.cos((2*x+1)*u*Math.PI/(2*size)) * Math.cos((2*y+1)*v*Math.PI/(2*size));
-      dct.push(sum);
-    }
-  const topLeft = [];
-  for (let u = 0; u < 8; u++)
-    for (let v = 0; v < 8; v++)
-      if (!(u===0&&v===0)) topLeft.push(dct[u*size+v]);
-  const mean = topLeft.reduce((a,b)=>a+b,0)/topLeft.length;
-  return topLeft.map(v => v > mean ? 1 : 0);
-}
-
-async function computeDHash(source) {
-  const pixels = await getPixels(source, 9);
-  const hash = [];
-  for (let row = 0; row < 8; row++)
-    for (let col = 0; col < 8; col++)
-      hash.push(pixels[row*9+col] > pixels[row*9+col+1] ? 1 : 0);
-  return hash;
-}
-
-async function computeAHash(source) {
-  const pixels = await getPixels(source, 8);
-  const mean = pixels.reduce((a,b)=>a+b,0)/pixels.length;
-  return pixels.map(v => v > mean ? 1 : 0);
-}
-
-// Wavelet-like hash — captures frequency bands, great for color/brightness edits
-async function computeWHash(source) {
-  const pixels = await getPixels(source, 8);
-  // Compare each pixel to its row average — catches brightness shifts well
-  const hash = [];
-  for (let row = 0; row < 8; row++) {
-    const rowPixels = pixels.slice(row*8, row*8+8);
-    const rowMean = rowPixels.reduce((a,b)=>a+b,0)/8;
-    for (let col = 0; col < 8; col++)
-      hash.push(rowPixels[col] > rowMean ? 1 : 0);
-  }
-  return hash;
-}
-
-function hammingDistance(a, b) {
-  let d = 0;
-  for (let i = 0; i < Math.min(a.length,b.length); i++) if (a[i]!==b[i]) d++;
-  return d;
-}
-
-function sim(dist, len) { return Math.round((1 - dist/len)*1000)/10; }
-
-async function computeAllHashes(source) {
-  const [ph, dh, ah, wh] = await Promise.all([
-    computePHash(source), computeDHash(source),
-    computeAHash(source), computeWHash(source),
-  ]);
-  return { pHash:ph, dHash:dh, aHash:ah, wHash:wh };
-}
-
-// ─────────────────────────────────────────────
-//  CROP DETECTION
-//  Crops 9 regions of the suspect image and checks
-//  if any region matches the original — catches heavy crops
-// ─────────────────────────────────────────────
-
-async function cropAndHash(sourceUrl, regions) {
-  const results = [];
-  for (const [lf, tf, rf, bf] of regions) {
-    await new Promise((resolve) => {
-      const img = new Image();
-      img.onload = async () => {
-        const w = img.naturalWidth, h = img.naturalHeight;
-        const canvas = document.createElement('canvas');
-        canvas.width = 32; canvas.height = 32;
-        const ctx = canvas.getContext('2d');
-        ctx.drawImage(img, lf*w, tf*h, (rf-lf)*w, (bf-tf)*h, 0, 0, 32, 32);
-        const url = canvas.toDataURL();
-        const hashes = await computeAllHashes(url);
-        results.push(hashes);
-        resolve();
-      };
-      img.src = sourceUrl;
-    });
-  }
-  return results;
-}
-
-const CROP_REGIONS = [
-  [0.0, 0.0, 0.6, 0.6],   // top-left
-  [0.4, 0.0, 1.0, 0.6],   // top-right
-  [0.0, 0.4, 0.6, 1.0],   // bottom-left
-  [0.4, 0.4, 1.0, 1.0],   // bottom-right
-  [0.2, 0.2, 0.8, 0.8],   // center 60%
-  [0.1, 0.1, 0.9, 0.9],   // center 80%
-  [0.0, 0.0, 1.0, 0.6],   // top strip
-  [0.0, 0.4, 1.0, 1.0],   // bottom strip
-  [0.15, 0.15, 0.85, 0.85], // tight center
-];
-
-// ─────────────────────────────────────────────
-//  BRIGHTNESS / COLOR FILTER DETECTION
-//  Computes average brightness of both images
-//  and compares — catches Instagram/Snapseed filters
-// ─────────────────────────────────────────────
-
-async function getBrightness(source) {
-  const pixels = await getPixels(source, 16);
-  return pixels.reduce((a,b)=>a+b,0)/pixels.length;
-}
-
-async function getColorChannels(source) {
-  return new Promise((resolve) => {
-    const canvas = document.createElement('canvas');
-    canvas.width = 16; canvas.height = 16;
-    const ctx = canvas.getContext('2d');
-    const draw = (img) => {
-      ctx.drawImage(img, 0, 0, 16, 16);
-      const data = ctx.getImageData(0, 0, 16, 16).data;
-      let r=0, g=0, b=0, count=0;
-      for (let i = 0; i < data.length; i += 4) {
-        r += data[i]; g += data[i+1]; b += data[i+2]; count++;
-      }
-      resolve({ r: r/count, g: g/count, b: b/count });
-    };
-    if (source instanceof HTMLVideoElement) { draw(source); }
-    else { const img = new Image(); img.onload = () => draw(img); img.src = source; }
-  });
-}
-
-// ─────────────────────────────────────────────
-//  MAIN COMPARE FUNCTION
-// ─────────────────────────────────────────────
-
-async function fullCompare(origSource, suspSource, origFile, suspFile) {
-  // Step 1 — base hashes
-  const [origH, suspH] = await Promise.all([
-    computeAllHashes(origSource),
-    computeAllHashes(suspSource),
-  ]);
-
-  const pDist = hammingDistance(origH.pHash, suspH.pHash);
-  const dDist = hammingDistance(origH.dHash, suspH.dHash);
-  const aDist = hammingDistance(origH.aHash, suspH.aHash);
-  const wDist = hammingDistance(origH.wHash, suspH.wHash);
-
-  const pSim = sim(pDist, origH.pHash.length);
-  const dSim = sim(dDist, origH.dHash.length);
-  const aSim = sim(aDist, origH.aHash.length);
-  const wSim = sim(wDist, origH.wHash.length);
-
-  // Weighted base score — wHash added for color sensitivity
-  const baseScore = Math.round((pSim*0.40 + dSim*0.25 + aSim*0.20 + wSim*0.15)*10)/10;
-
-  // Step 2 — brightness & color channel comparison
-  const [origBright, suspBright] = await Promise.all([
-    getBrightness(origSource), getBrightness(suspSource),
-  ]);
-  const brightnessDiff = Math.abs(origBright - suspBright);
-  const brightnessEdited = brightnessDiff > 8;  // >8 brightness units = edited
-
-  const [origColor, suspColor] = await Promise.all([
-    getColorChannels(origSource), getColorChannels(suspSource),
-  ]);
-  const rDiff = Math.abs(origColor.r - suspColor.r);
-  const gDiff = Math.abs(origColor.g - suspColor.g);
-  const bDiff = Math.abs(origColor.b - suspColor.b);
-  const colorFilterDetected = (rDiff > 10 || gDiff > 10 || bDiff > 10);
-
-  // Step 3 — crop detection (only works on images with URLs, not video elements)
-  let cropScore = 0;
-  let cropDetected = false;
-  let bestCropRegion = null;
-
-  if (typeof origSource === 'string' && typeof suspSource === 'string') {
-    try {
-      const suspCrops = await cropAndHash(suspSource, CROP_REGIONS);
-      for (let i = 0; i < suspCrops.length; i++) {
-        const crop = suspCrops[i];
-        const cp = sim(hammingDistance(origH.pHash, crop.pHash), origH.pHash.length);
-        const cd = sim(hammingDistance(origH.dHash, crop.dHash), origH.dHash.length);
-        const ca = sim(hammingDistance(origH.aHash, crop.aHash), origH.aHash.length);
-        const cs = Math.round((cp*0.5 + cd*0.3 + ca*0.2)*10)/10;
-        if (cs > cropScore) { cropScore = cs; bestCropRegion = i; }
-      }
-      // Also check original crops against suspect full image
-      const origCrops = await cropAndHash(origSource, CROP_REGIONS);
-      for (let i = 0; i < origCrops.length; i++) {
-        const crop = origCrops[i];
-        const cp = sim(hammingDistance(crop.pHash, suspH.pHash), crop.pHash.length);
-        const cd = sim(hammingDistance(crop.dHash, suspH.dHash), crop.dHash.length);
-        const ca = sim(hammingDistance(crop.aHash, suspH.aHash), crop.aHash.length);
-        const cs = Math.round((cp*0.5 + cd*0.3 + ca*0.2)*10)/10;
-        if (cs > cropScore) { cropScore = cs; bestCropRegion = i; }
-      }
-      cropDetected = cropScore >= 60;
-    } catch { cropScore = 0; }
-  }
-
-  // Step 4 — mirror detection (flip suspect horizontally and compare)
-  let mirrorDetected = false;
-  let mirrorScore = 0;
-  if (typeof suspSource === 'string') {
-    try {
-      await new Promise((resolve) => {
-        const img = new Image();
-        img.onload = async () => {
-          const canvas = document.createElement('canvas');
-          canvas.width = 32; canvas.height = 32;
-          const ctx = canvas.getContext('2d');
-          ctx.translate(32, 0); ctx.scale(-1, 1);
-          ctx.drawImage(img, 0, 0, 32, 32);
-          const flippedUrl = canvas.toDataURL();
-          const flippedH = await computeAllHashes(flippedUrl);
-          const mp = sim(hammingDistance(origH.pHash, flippedH.pHash), origH.pHash.length);
-          const md = sim(hammingDistance(origH.dHash, flippedH.dHash), origH.dHash.length);
-          mirrorScore = Math.round((mp*0.6 + md*0.4)*10)/10;
-          mirrorDetected = mirrorScore >= 75;
-          resolve();
-        };
-        img.src = suspSource;
-      });
-    } catch { mirrorScore = 0; }
-  }
-
-  // Step 5 — final weighted score
-  // Boost score if crop or mirror detected
-  let finalScore = baseScore;
-  if (cropDetected && cropScore > finalScore) finalScore = Math.round((finalScore*0.4 + cropScore*0.6)*10)/10;
-  if (mirrorDetected && mirrorScore > finalScore) finalScore = Math.round((finalScore*0.5 + mirrorScore*0.5)*10)/10;
-
-  // Cap at 100
-  finalScore = Math.min(100, finalScore);
-
-  // Step 6 — verdict
-  let status, reason;
-  if (finalScore >= 85) {
-    status = 'STOLEN';
-    reason = 'Content is near-identical. This is a pirated copy.';
-  } else if (finalScore >= 70) {
-    status = 'SUSPICIOUS';
-    reason = 'Significant similarity detected. Likely edited copy.';
-  } else if (finalScore >= 50) {
-    status = 'INVESTIGATING';
-    reason = 'Partial match. May be a heavily cropped or edited version.';
-  } else {
-    status = 'CLEAN';
-    reason = 'Content appears different. No piracy detected.';
-  }
-
-  return {
-    overall: finalScore,
-    pSim, dSim, aSim, wSim,
-    pDist, dDist, aDist, wDist,
-    status, reason,
-    brightnessEdited,
-    brightnessDiff: Math.round(brightnessDiff*10)/10,
-    colorFilterDetected,
-    colorDiff: { r: Math.round(rDiff), g: Math.round(gDiff), b: Math.round(bDiff) },
-    cropDetected,
-    cropScore,
-    bestCropRegion,
-    mirrorDetected,
-    mirrorScore,
-  };
-}
+const FLASK_URL = 'http://localhost:5000/compare';
 
 // ─────────────────────────────────────────────
 //  VIDEO FRAME EXTRACTION
+//  Extracts N evenly-spaced frames from a video file
+//  Returns array of { blob, dataUrl, timestamp }
 // ─────────────────────────────────────────────
 
-function extractVideoFrame(file) {
+function extractVideoFrames(file, numFrames = 3) {
   return new Promise((resolve, reject) => {
     const video = document.createElement('video');
     const url = URL.createObjectURL(file);
-    video.src = url; video.muted = true;
-    video.addEventListener('loadeddata', () => {
-      video.currentTime = Math.min(2, video.duration * 0.3);
+    video.src = url;
+    video.muted = true;
+    video.preload = 'metadata';
+
+    video.addEventListener('error', () => {
+      URL.revokeObjectURL(url);
+      reject(new Error('Video load failed'));
     });
-    video.addEventListener('seeked', () => resolve({ video, url }));
+
+    video.addEventListener('loadedmetadata', () => {
+      const duration = video.duration;
+      // Pick timestamps: skip first & last 5% to avoid black frames
+      const start = duration * 0.05;
+      const end = duration * 0.95;
+      const step = (end - start) / (numFrames - 1 || 1);
+      const timestamps = Array.from({ length: numFrames }, (_, i) =>
+        numFrames === 1 ? start : start + i * step
+      );
+
+      const frames = [];
+      let idx = 0;
+
+      const seekNext = () => {
+        if (idx >= timestamps.length) {
+          URL.revokeObjectURL(url);
+          resolve(frames);
+          return;
+        }
+        video.currentTime = timestamps[idx];
+      };
+
+      video.addEventListener('seeked', () => {
+        const canvas = document.createElement('canvas');
+        canvas.width = video.videoWidth || 640;
+        canvas.height = video.videoHeight || 360;
+        canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
+        canvas.toBlob((blob) => {
+          const dataUrl = canvas.toDataURL('image/jpeg', 0.92);
+          frames.push({ blob, dataUrl, timestamp: timestamps[idx] });
+          idx++;
+          seekNext();
+        }, 'image/jpeg', 0.92);
+      });
+
+      seekNext();
+    });
+
+    video.load();
+  });
+}
+
+// ─────────────────────────────────────────────
+//  SINGLE FRAME EXTRACTION (for preview)
+// ─────────────────────────────────────────────
+
+function extractSingleFrame(file) {
+  return new Promise((resolve, reject) => {
+    const video = document.createElement('video');
+    const url = URL.createObjectURL(file);
+    video.src = url;
+    video.muted = true;
+
+    video.addEventListener('loadeddata', () => {
+      video.currentTime = Math.min(2, (video.duration || 4) * 0.3);
+    });
+
+    video.addEventListener('seeked', () => {
+      const canvas = document.createElement('canvas');
+      canvas.width = 200;
+      canvas.height = 120;
+      canvas.getContext('2d').drawImage(video, 0, 0, 200, 120);
+      const preview = canvas.toDataURL('image/jpeg', 0.85);
+      URL.revokeObjectURL(url);
+      resolve(preview);
+    });
+
     video.addEventListener('error', reject);
     video.load();
   });
+}
+
+// ─────────────────────────────────────────────
+//  FLASK API CALL
+//  Sends original + suspect as FormData to /compare
+//  Returns the JSON result from Flask
+// ─────────────────────────────────────────────
+
+async function callFlaskCompare(origBlob, suspBlob, origName, suspName) {
+  const form = new FormData();
+  form.append('file_a', origBlob, origName);
+  form.append('file_b', suspBlob, suspName);
+
+  const response = await fetch(FLASK_URL, {
+    method: 'POST',
+    body: form,
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Flask error ${response.status}: ${text}`);
+  }
+
+  return await response.json();
+}
+
+// ─────────────────────────────────────────────
+//  FILE → BLOB HELPER
+//  Images: use the file directly
+//  Videos: extract 3 frames, compare each, return best
+// ─────────────────────────────────────────────
+
+async function fileToBlob(file) {
+  if (file.type.startsWith('image/')) {
+    return [{ blob: file, name: file.name, isFrame: false, timestamp: null }];
+  }
+  // Video — extract 3 frames
+  const frames = await extractVideoFrames(file, 3);
+  return frames.map((f, i) => ({
+    blob: f.blob,
+    name: `${file.name}_frame${i + 1}.jpg`,
+    isFrame: true,
+    timestamp: f.timestamp,
+    dataUrl: f.dataUrl,
+  }));
+}
+
+// ─────────────────────────────────────────────
+//  FULL COMPARE — orchestrates all frame pairs
+//  Returns: best result + per-frame breakdown
+// ─────────────────────────────────────────────
+
+async function fullCompare(origFile, suspFile, onStep) {
+  onStep('📦 Preparing files for upload...');
+  const [origItems, suspItems] = await Promise.all([
+    fileToBlob(origFile),
+    fileToBlob(suspFile),
+  ]);
+
+  // Build comparison pairs:
+  // If both are images → 1 comparison
+  // If orig is image, susp is video → compare orig vs each susp frame
+  // If orig is video, susp is image → compare each orig frame vs susp
+  // If both are videos → compare orig frame[i] vs susp frame[i] for each i
+  const pairs = [];
+
+  if (origItems.length === 1 && suspItems.length === 1) {
+    pairs.push({ orig: origItems[0], susp: suspItems[0], label: 'Image vs Image' });
+  } else if (origItems.length === 1) {
+    suspItems.forEach((s, i) =>
+      pairs.push({ orig: origItems[0], susp: s, label: `Image vs Video Frame ${i + 1} (${s.timestamp?.toFixed(1)}s)` })
+    );
+  } else if (suspItems.length === 1) {
+    origItems.forEach((o, i) =>
+      pairs.push({ orig: o, susp: suspItems[0], label: `Video Frame ${i + 1} (${o.timestamp?.toFixed(1)}s) vs Image` })
+    );
+  } else {
+    // Both videos — compare corresponding frames + cross-compare for thoroughness
+    for (let oi = 0; oi < origItems.length; oi++) {
+      for (let si = 0; si < suspItems.length; si++) {
+        pairs.push({
+          orig: origItems[oi],
+          susp: suspItems[si],
+          label: `Orig Frame ${oi + 1} vs Susp Frame ${si + 1}`,
+        });
+      }
+    }
+  }
+
+  const frameResults = [];
+  for (let i = 0; i < pairs.length; i++) {
+    const pair = pairs[i];
+    onStep(`🔍 Comparing ${pair.label}... (${i + 1}/${pairs.length})`);
+    try {
+      const result = await callFlaskCompare(pair.orig.blob, pair.susp.blob, pair.orig.name, pair.susp.name);
+      frameResults.push({ ...result, label: pair.label, pairIndex: i });
+    } catch (err) {
+      frameResults.push({
+        error: err.message,
+        label: pair.label,
+        pairIndex: i,
+        overall: 0,
+        status: 'ERROR',
+      });
+    }
+  }
+
+  // Pick the result with the highest overall confidence
+  const best = frameResults.reduce((a, b) => ((a.overall || 0) >= (b.overall || 0) ? a : b), frameResults[0]);
+
+  return {
+    best,
+    allFrames: frameResults,
+    totalPairs: pairs.length,
+    isMultiFrame: pairs.length > 1,
+  };
 }
 
 // ─────────────────────────────────────────────
@@ -318,21 +219,24 @@ function extractVideoFrame(file) {
 
 const COLORS = {
   green: '#16a34a', greenLight: '#22c55e',
-  red: '#dc2626',   redLight: '#ef4444',
+  red: '#dc2626', redLight: '#ef4444',
   amber: '#d97706', amberLight: '#f59e0b',
-  blue: '#1d4ed8',  blueLight: '#3b82f6',
+  blue: '#1d4ed8', blueLight: '#3b82f6',
   bg: '#0f172a', surface: '#1e293b', border: '#334155',
   text: '#f1f5f9', muted: '#94a3b8',
 };
 
 const statusCfg = {
-  STOLEN:        { color:'#ef4444', bg:'rgba(220,38,38,0.12)',  border:'rgba(220,38,38,0.35)',  icon:'🚨' },
-  SUSPICIOUS:    { color:'#f59e0b', bg:'rgba(217,119,6,0.12)',  border:'rgba(217,119,6,0.35)',  icon:'⚠️' },
-  INVESTIGATING: { color:'#f59e0b', bg:'rgba(245,158,11,0.10)', border:'rgba(245,158,11,0.25)', icon:'🔍' },
-  CLEAN:         { color:'#22c55e', bg:'rgba(22,163,74,0.12)',  border:'rgba(22,163,74,0.35)',  icon:'✅' },
+  STOLEN: { color: '#ef4444', bg: 'rgba(220,38,38,0.12)', border: 'rgba(220,38,38,0.35)', icon: '🚨' },
+  SUSPICIOUS: { color: '#f59e0b', bg: 'rgba(217,119,6,0.12)', border: 'rgba(217,119,6,0.35)', icon: '⚠️' },
+  INVESTIGATING: { color: '#f59e0b', bg: 'rgba(245,158,11,0.10)', border: 'rgba(245,158,11,0.25)', icon: '🔍' },
+  CLEAN: { color: '#22c55e', bg: 'rgba(22,163,74,0.12)', border: 'rgba(22,163,74,0.35)', icon: '✅' },
+  ERROR: { color: '#94a3b8', bg: 'rgba(148,163,184,0.08)', border: 'rgba(148,163,184,0.2)', icon: '❌' },
 };
 
-const platformColors = { YouTube:'#ef4444', Instagram:'#ec4899', Telegram:'#3b82f6', Reddit:'#f97316', Twitter:'#38bdf8' };
+const platformColors = {
+  YouTube: '#ef4444', Instagram: '#ec4899', Telegram: '#3b82f6', Reddit: '#f97316', Twitter: '#38bdf8',
+};
 
 // ─────────────────────────────────────────────
 //  COMPONENTS
@@ -341,17 +245,71 @@ const platformColors = { YouTube:'#ef4444', Instagram:'#ec4899', Telegram:'#3b82
 function DropZone({ label, file, preview, onFile, accept, hint }) {
   const ref = useRef();
   const [drag, setDrag] = useState(false);
-  const drop = (e) => { e.preventDefault(); setDrag(false); const f = e.dataTransfer.files[0]; if (f) onFile(f); };
+  const drop = (e) => {
+    e.preventDefault();
+    setDrag(false);
+    const f = e.dataTransfer.files[0];
+    if (f) onFile(f);
+  };
+  const isVideo = file?.type?.startsWith('video/');
   return (
-    <div onClick={() => ref.current.click()}
-      onDragOver={e => { e.preventDefault(); setDrag(true); }}
-      onDragLeave={() => setDrag(false)} onDrop={drop}
-      style={{ border: `2px dashed ${drag ? COLORS.greenLight : file ? COLORS.green : COLORS.border}`, borderRadius: 12, background: drag ? 'rgba(34,197,94,0.06)' : file ? 'rgba(34,197,94,0.04)' : 'rgba(255,255,255,0.02)', padding: '20px 16px', textAlign: 'center', cursor: 'pointer', transition: 'all 0.2s', minHeight: 160, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 8 }}>
-      <input ref={ref} type="file" accept={accept} style={{ display: 'none' }} onChange={e => e.target.files[0] && onFile(e.target.files[0])} />
-      {preview ? <img src={preview} alt="preview" style={{ maxHeight: 100, maxWidth: '100%', borderRadius: 8, objectFit: 'contain', marginBottom: 4 }} />
-        : <div style={{ fontSize: 36 }}>{accept.includes('video') ? '🎬' : '🖼️'}</div>}
-      <div style={{ fontWeight: 700, fontSize: 13, color: file ? COLORS.greenLight : COLORS.text, letterSpacing: 1 }}>{file ? file.name : label}</div>
-      {file && <div style={{ fontSize: 11, color: COLORS.muted }}>{(file.size/1024/1024).toFixed(2)} MB</div>}
+    <div
+      onClick={() => ref.current.click()}
+      onDragOver={(e) => { e.preventDefault(); setDrag(true); }}
+      onDragLeave={() => setDrag(false)}
+      onDrop={drop}
+      style={{
+        border: `2px dashed ${drag ? COLORS.greenLight : file ? COLORS.green : COLORS.border}`,
+        borderRadius: 12,
+        background: drag ? 'rgba(34,197,94,0.06)' : file ? 'rgba(34,197,94,0.04)' : 'rgba(255,255,255,0.02)',
+        padding: '20px 16px',
+        textAlign: 'center',
+        cursor: 'pointer',
+        transition: 'all 0.2s',
+        minHeight: 160,
+        display: 'flex',
+        flexDirection: 'column',
+        alignItems: 'center',
+        justifyContent: 'center',
+        gap: 8,
+      }}
+    >
+      <input
+        ref={ref}
+        type="file"
+        accept={accept}
+        style={{ display: 'none' }}
+        onChange={(e) => e.target.files[0] && onFile(e.target.files[0])}
+      />
+      {preview ? (
+        <img
+          src={preview}
+          alt="preview"
+          style={{ maxHeight: 100, maxWidth: '100%', borderRadius: 8, objectFit: 'contain', marginBottom: 4 }}
+        />
+      ) : (
+        <div style={{ fontSize: 36 }}>{accept.includes('video') ? '🎬' : '🖼️'}</div>
+      )}
+      <div style={{ fontWeight: 700, fontSize: 13, color: file ? COLORS.greenLight : COLORS.text, letterSpacing: 1 }}>
+        {file ? file.name : label}
+      </div>
+      {file && (
+        <div style={{ fontSize: 11, color: COLORS.muted, display: 'flex', gap: 8, alignItems: 'center' }}>
+          <span>{(file.size / 1024 / 1024).toFixed(2)} MB</span>
+          {isVideo && (
+            <span style={{
+              background: 'rgba(59,130,246,0.15)',
+              border: '1px solid rgba(59,130,246,0.3)',
+              color: COLORS.blueLight,
+              padding: '1px 6px',
+              borderRadius: 4,
+              fontSize: 10,
+            }}>
+              🎬 3 FRAMES
+            </span>
+          )}
+        </div>
+      )}
       {!file && <div style={{ fontSize: 11, color: COLORS.muted }}>{hint}</div>}
     </div>
   );
@@ -365,7 +323,15 @@ function Meter({ label, value, color }) {
         <span style={{ fontSize: 12, fontWeight: 700, color }}>{value}%</span>
       </div>
       <div style={{ height: 6, background: 'rgba(255,255,255,0.08)', borderRadius: 3, overflow: 'hidden' }}>
-        <div style={{ height: '100%', width: `${value}%`, background: color, borderRadius: 3, transition: 'width 0.8s ease' }} />
+        <div
+          style={{
+            height: '100%',
+            width: `${value}%`,
+            background: color,
+            borderRadius: 3,
+            transition: 'width 0.8s ease',
+          }}
+        />
       </div>
     </div>
   );
@@ -373,17 +339,119 @@ function Meter({ label, value, color }) {
 
 function DetCard({ icon, label, detected, sub }) {
   return (
-    <div style={{ background: detected ? 'rgba(245,158,11,0.08)' : 'rgba(255,255,255,0.03)', border: `1px solid ${detected ? 'rgba(245,158,11,0.3)' : COLORS.border}`, borderRadius: 8, padding: '10px 12px', textAlign: 'center' }}>
+    <div
+      style={{
+        background: detected ? 'rgba(245,158,11,0.08)' : 'rgba(255,255,255,0.03)',
+        border: `1px solid ${detected ? 'rgba(245,158,11,0.3)' : COLORS.border}`,
+        borderRadius: 8,
+        padding: '10px 12px',
+        textAlign: 'center',
+      }}
+    >
       <div style={{ fontSize: 20, marginBottom: 4 }}>{icon}</div>
       <div style={{ fontSize: 10, color: COLORS.muted, marginBottom: 4 }}>{label}</div>
-      <div style={{ fontSize: 11, fontWeight: 700, color: detected ? COLORS.amberLight : COLORS.greenLight }}>{detected ? 'DETECTED' : 'NOT DETECTED'}</div>
+      <div style={{ fontSize: 11, fontWeight: 700, color: detected ? COLORS.amberLight : COLORS.greenLight }}>
+        {detected ? 'DETECTED' : 'NOT DETECTED'}
+      </div>
       {sub && <div style={{ fontSize: 10, color: COLORS.muted, marginTop: 2 }}>{sub}</div>}
     </div>
   );
 }
 
-// ── DMCA Modal — letter defined first, then used ──
+// Frame results breakdown table
+function FrameBreakdown({ frames }) {
+  if (!frames || frames.length <= 1) return null;
+  return (
+    <div
+      style={{
+        background: 'rgba(0,0,0,0.2)',
+        borderRadius: 10,
+        padding: 16,
+        marginTop: 14,
+      }}
+    >
+      <div style={{ fontSize: 11, color: COLORS.muted, letterSpacing: 1.5, marginBottom: 10 }}>
+        🎬 PER-FRAME BREAKDOWN — BEST RESULT SHOWN ABOVE
+      </div>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+        {frames.map((f, i) => {
+          const sc = statusCfg[f.status] || statusCfg.ERROR;
+          const isBest = frames.indexOf(frames.reduce((a, b) => ((a.overall || 0) >= (b.overall || 0) ? a : b))) === i;
+          return (
+            <div
+              key={i}
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 10,
+                padding: '8px 12px',
+                background: isBest ? 'rgba(59,130,246,0.08)' : 'rgba(255,255,255,0.02)',
+                border: `1px solid ${isBest ? 'rgba(59,130,246,0.3)' : COLORS.border}`,
+                borderRadius: 8,
+              }}
+            >
+              {isBest && (
+                <span
+                  style={{
+                    fontSize: 9,
+                    background: 'rgba(59,130,246,0.2)',
+                    color: COLORS.blueLight,
+                    padding: '2px 6px',
+                    borderRadius: 4,
+                    fontWeight: 700,
+                    whiteSpace: 'nowrap',
+                  }}
+                >
+                  BEST
+                </span>
+              )}
+              <div style={{ flex: 1, fontSize: 11, color: COLORS.muted, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                {f.label}
+              </div>
+              {f.error ? (
+                <span style={{ fontSize: 11, color: COLORS.red }}>{f.error}</span>
+              ) : (
+                <>
+                  <div style={{ width: 80, height: 4, background: 'rgba(255,255,255,0.1)', borderRadius: 2 }}>
+                    <div
+                      style={{
+                        height: '100%',
+                        width: `${f.overall || 0}%`,
+                        background: sc.color,
+                        borderRadius: 2,
+                      }}
+                    />
+                  </div>
+                  <span style={{ fontSize: 12, fontWeight: 700, color: sc.color, minWidth: 40, textAlign: 'right' }}>
+                    {f.overall ?? '—'}%
+                  </span>
+                  <span
+                    style={{
+                      background: sc.bg,
+                      border: `1px solid ${sc.border}`,
+                      color: sc.color,
+                      fontSize: 9,
+                      fontWeight: 700,
+                      padding: '2px 8px',
+                      borderRadius: 20,
+                      whiteSpace: 'nowrap',
+                    }}
+                  >
+                    {sc.icon} {f.status}
+                  </span>
+                </>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// ── DMCA Modal ──
 function DmcaModal({ result, origFile, suspFile, onClose }) {
+  const r = result?.best || result || {};
   const letter = `DMCA TAKEDOWN NOTICE
 Sports Guardian — Detection Engine
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -394,17 +462,14 @@ RE: Unauthorized Sports Content
 INFRINGING CONTENT:
 • Original File      : ${origFile?.name || 'Registered content'}
 • Suspected Copy     : ${suspFile?.name || 'Detected content'}
-• Overall Confidence : ${result?.overall}%
-• pHash Similarity   : ${result?.pSim}%
-• dHash Similarity   : ${result?.dSim}%
-• aHash Similarity   : ${result?.aSim}%
-• wHash Similarity   : ${result?.wSim}%
-• Color Filter       : ${result?.colorFilterDetected ? 'DETECTED' : 'NOT DETECTED'}
-• Brightness Edit    : ${result?.brightnessEdited ? 'DETECTED' : 'NOT DETECTED'}
-• Crop Detected      : ${result?.cropDetected ? 'DETECTED' : 'NOT DETECTED'}
-• Mirror Detected    : ${result?.mirrorDetected ? 'DETECTED' : 'NOT DETECTED'}
-• Detection Method   : Quad Hash + Crop + Color + Mirror Analysis
-• Verdict            : ${result?.status}
+• Overall Confidence : ${r.overall ?? '—'}%
+• Detection Method   : ORB + 13-Region Crop + Rotation + Mirror (Flask)
+• Verdict            : ${r.status ?? '—'}
+• Best Match Frame   : ${r.label ?? 'N/A'}
+${r.orb_score !== undefined ? `• ORB Score          : ${r.orb_score}%` : ''}
+${r.crop_score !== undefined ? `• Crop Score         : ${r.crop_score}%` : ''}
+${r.mirror_detected !== undefined ? `• Mirror Detected    : ${r.mirror_detected ? 'YES' : 'NO'}` : ''}
+${r.rotation_detected !== undefined ? `• Rotation Detected  : ${r.rotation_detected ? 'YES' : 'NO'}` : ''}
 
 I have a good faith belief that this content infringes on
 the copyright of the registered content owner. I request
@@ -417,22 +482,119 @@ immediate removal under DMCA Section 512(c).
     const blob = new Blob([letter], { type: 'text/plain' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
-    a.href = url; a.download = `DMCA_Notice_${Date.now()}.txt`; a.click();
+    a.href = url;
+    a.download = `DMCA_Notice_${Date.now()}.txt`;
+    a.click();
     URL.revokeObjectURL(url);
   };
 
   return (
-    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.75)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000, backdropFilter: 'blur(6px)' }} onClick={onClose}>
-      <div style={{ background: COLORS.surface, border: `1px solid ${COLORS.border}`, borderRadius: 16, padding: 28, maxWidth: 520, width: '90%', boxShadow: '0 20px 60px rgba(0,0,0,0.5)' }} onClick={e => e.stopPropagation()}>
+    <div
+      style={{
+        position: 'fixed',
+        inset: 0,
+        background: 'rgba(0,0,0,0.75)',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        zIndex: 1000,
+        backdropFilter: 'blur(6px)',
+      }}
+      onClick={onClose}
+    >
+      <div
+        style={{
+          background: COLORS.surface,
+          border: `1px solid ${COLORS.border}`,
+          borderRadius: 16,
+          padding: 28,
+          maxWidth: 520,
+          width: '90%',
+          boxShadow: '0 20px 60px rgba(0,0,0,0.5)',
+        }}
+        onClick={(e) => e.stopPropagation()}
+      >
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
           <div style={{ fontWeight: 800, fontSize: 15, color: COLORS.text, letterSpacing: 1 }}>DMCA TAKEDOWN NOTICE</div>
-          <button onClick={onClose} style={{ background: 'none', border: `1px solid ${COLORS.border}`, color: COLORS.muted, width: 30, height: 30, borderRadius: 6, cursor: 'pointer', fontSize: 16 }}>×</button>
+          <button
+            onClick={onClose}
+            style={{
+              background: 'none',
+              border: `1px solid ${COLORS.border}`,
+              color: COLORS.muted,
+              width: 30,
+              height: 30,
+              borderRadius: 6,
+              cursor: 'pointer',
+              fontSize: 16,
+            }}
+          >
+            ×
+          </button>
         </div>
-        <textarea readOnly value={letter} style={{ width: '100%', height: 260, background: 'rgba(0,0,0,0.3)', border: `1px solid ${COLORS.border}`, color: '#ccc', padding: 14, borderRadius: 8, fontFamily: 'monospace', fontSize: 11, resize: 'none', boxSizing: 'border-box' }} />
+        <textarea
+          readOnly
+          value={letter}
+          style={{
+            width: '100%',
+            height: 280,
+            background: 'rgba(0,0,0,0.3)',
+            border: `1px solid ${COLORS.border}`,
+            color: '#ccc',
+            padding: 14,
+            borderRadius: 8,
+            fontFamily: 'monospace',
+            fontSize: 11,
+            resize: 'none',
+            boxSizing: 'border-box',
+          }}
+        />
         <div style={{ display: 'flex', gap: 10, marginTop: 14 }}>
-          <button onClick={() => navigator.clipboard.writeText(letter)} style={{ flex: 1, background: COLORS.green, color: '#fff', border: 'none', padding: '10px', borderRadius: 8, fontWeight: 700, fontSize: 12, cursor: 'pointer' }}>📋 COPY</button>
-          <button onClick={download} style={{ flex: 1, background: COLORS.blue, color: '#fff', border: 'none', padding: '10px', borderRadius: 8, fontWeight: 700, fontSize: 12, cursor: 'pointer' }}>⬇️ DOWNLOAD</button>
-          <button onClick={onClose} style={{ padding: '10px 18px', background: 'rgba(255,255,255,0.05)', border: `1px solid ${COLORS.border}`, color: COLORS.muted, borderRadius: 8, cursor: 'pointer' }}>CLOSE</button>
+          <button
+            onClick={() => navigator.clipboard.writeText(letter)}
+            style={{
+              flex: 1,
+              background: COLORS.green,
+              color: '#fff',
+              border: 'none',
+              padding: '10px',
+              borderRadius: 8,
+              fontWeight: 700,
+              fontSize: 12,
+              cursor: 'pointer',
+            }}
+          >
+            📋 COPY
+          </button>
+          <button
+            onClick={download}
+            style={{
+              flex: 1,
+              background: COLORS.blue,
+              color: '#fff',
+              border: 'none',
+              padding: '10px',
+              borderRadius: 8,
+              fontWeight: 700,
+              fontSize: 12,
+              cursor: 'pointer',
+            }}
+          >
+            ⬇️ DOWNLOAD
+          </button>
+          <button
+            onClick={onClose}
+            style={{
+              padding: '10px 18px',
+              background: 'rgba(255,255,255,0.05)',
+              border: `1px solid ${COLORS.border}`,
+              color: COLORS.muted,
+              borderRadius: 8,
+              cursor: 'pointer',
+            }}
+          >
+            CLOSE
+          </button>
         </div>
       </div>
     </div>
@@ -446,145 +608,186 @@ immediate removal under DMCA Section 512(c).
 export default function App() {
   const [tab, setTab] = useState('compare');
 
+  // Original file state
   const [origFile, setOrigFile] = useState(null);
   const [origPreview, setOrigPreview] = useState(null);
-  const [origSource, setOrigSource] = useState(null);
   const [origStatus, setOrigStatus] = useState('');
 
+  // Suspect file state
   const [suspFile, setSuspFile] = useState(null);
   const [suspPreview, setSuspPreview] = useState(null);
-  const [suspSource, setSuspSource] = useState(null);
   const [suspStatus, setSuspStatus] = useState('');
 
-  const [result, setResult] = useState(null);
+  // Comparison result state
+  const [compareResult, setCompareResult] = useState(null); // { best, allFrames, totalPairs, isMultiFrame }
   const [comparing, setComparing] = useState(false);
   const [compareStep, setCompareStep] = useState('');
+  const [compareError, setCompareError] = useState('');
   const [dmcaOpen, setDmcaOpen] = useState(false);
 
+  // Register tab state
   const [regFile, setRegFile] = useState(null);
   const [regPreview, setRegPreview] = useState(null);
-  const [regHashes, setRegHashes] = useState(null);
   const [regLog, setRegLog] = useState([]);
   const [regDone, setRegDone] = useState(false);
 
   const mockAlerts = [
-    { id:1, platform:'YouTube',   uploader:'@cricket_highlights_hd', clip:'Kohli Century — T20 World Cup',  confidence:97.3, status:'STOLEN' },
-    { id:2, platform:'Instagram', uploader:'@sports_reels_india',    clip:'Bumrah Hat-trick Celebration',   confidence:91.8, status:'STOLEN' },
-    { id:3, platform:'Telegram',  uploader:'IPL Leaks Channel',      clip:'Rohit Sharma Six Compilation',   confidence:88.5, status:'SUSPICIOUS' },
-    { id:4, platform:'YouTube',   uploader:'@fan_edits_cricket',     clip:'Dhoni Finishes Off in Style',    confidence:76.2, status:'INVESTIGATING' },
-    { id:5, platform:'Reddit',    uploader:'u/cricket_fan_2024',     clip:'Shami Bowling Masterclass',      confidence:42.1, status:'CLEAN' },
+    { id: 1, platform: 'YouTube', uploader: '@cricket_highlights_hd', clip: 'Kohli Century — T20 World Cup', confidence: 97.3, status: 'STOLEN' },
+    { id: 2, platform: 'Instagram', uploader: '@sports_reels_india', clip: 'Bumrah Hat-trick Celebration', confidence: 91.8, status: 'STOLEN' },
+    { id: 3, platform: 'Telegram', uploader: 'IPL Leaks Channel', clip: 'Rohit Sharma Six Compilation', confidence: 88.5, status: 'SUSPICIOUS' },
+    { id: 4, platform: 'YouTube', uploader: '@fan_edits_cricket', clip: 'Dhoni Finishes Off in Style', confidence: 76.2, status: 'INVESTIGATING' },
+    { id: 5, platform: 'Reddit', uploader: 'u/cricket_fan_2024', clip: 'Shami Bowling Masterclass', confidence: 42.1, status: 'CLEAN' },
   ];
 
+  // Load original file — generate preview only (no hashing on frontend)
   const loadOrig = useCallback(async (file) => {
-    setOrigFile(file); setResult(null); setOrigStatus('Processing...');
-    setOrigSource(null); setOrigPreview(null);
+    setOrigFile(file);
+    setCompareResult(null);
+    setCompareError('');
+    setOrigStatus('Processing...');
+    setOrigPreview(null);
     try {
       if (file.type.startsWith('video/')) {
-        const { video, url } = await extractVideoFrame(file);
-        const canvas = document.createElement('canvas');
-        canvas.width = 200; canvas.height = 120;
-        canvas.getContext('2d').drawImage(video, 0, 0, 200, 120);
-        const preview = canvas.toDataURL();
+        const preview = await extractSingleFrame(file);
         setOrigPreview(preview);
-        setOrigSource(video);
-        URL.revokeObjectURL(url);
       } else {
-        const url = URL.createObjectURL(file);
-        setOrigPreview(url);
-        setOrigSource(url);
+        setOrigPreview(URL.createObjectURL(file));
       }
       setOrigStatus('✅ Ready');
-    } catch { setOrigStatus('❌ Failed to load'); }
+    } catch {
+      setOrigStatus('❌ Failed to load');
+    }
   }, []);
 
+  // Load suspect file — generate preview only
   const loadSusp = useCallback(async (file) => {
-    setSuspFile(file); setResult(null); setSuspStatus('Processing...');
-    setSuspSource(null); setSuspPreview(null);
+    setSuspFile(file);
+    setCompareResult(null);
+    setCompareError('');
+    setSuspStatus('Processing...');
+    setSuspPreview(null);
     try {
       if (file.type.startsWith('video/')) {
-        const { video, url } = await extractVideoFrame(file);
-        const canvas = document.createElement('canvas');
-        canvas.width = 200; canvas.height = 120;
-        canvas.getContext('2d').drawImage(video, 0, 0, 200, 120);
-        const preview = canvas.toDataURL();
+        const preview = await extractSingleFrame(file);
         setSuspPreview(preview);
-        setSuspSource(video);
-        URL.revokeObjectURL(url);
       } else {
-        const url = URL.createObjectURL(file);
-        setSuspPreview(url);
-        setSuspSource(url);
+        setSuspPreview(URL.createObjectURL(file));
       }
       setSuspStatus('✅ Ready');
-    } catch { setSuspStatus('❌ Failed to load'); }
+    } catch {
+      setSuspStatus('❌ Failed to load');
+    }
   }, []);
 
+  // Run the full comparison against Flask
   const runComparison = async () => {
-    if (!origSource || !suspSource) return;
-    setComparing(true); setResult(null);
-    setCompareStep('🔍 Computing quad hash fingerprints...');
-    await new Promise(r => setTimeout(r, 300));
-    setCompareStep('✂️ Running 9-region crop detection...');
-    await new Promise(r => setTimeout(r, 300));
-    setCompareStep('🎨 Analysing color channels & brightness...');
-    await new Promise(r => setTimeout(r, 200));
+    if (!origFile || !suspFile || comparing) return;
+    setComparing(true);
+    setCompareResult(null);
+    setCompareError('');
+
     try {
-      const res = await fullCompare(origSource, suspSource, origFile, suspFile);
-      setResult(res);
-    } catch (e) {
-      console.error(e);
+      const result = await fullCompare(origFile, suspFile, (step) => setCompareStep(step));
+      setCompareResult(result);
+    } catch (err) {
+      console.error(err);
+      setCompareError(`Error: ${err.message}. Make sure Flask is running on ${FLASK_URL}`);
     }
-    setComparing(false); setCompareStep('');
+
+    setComparing(false);
+    setCompareStep('');
   };
 
+  // Register tab — just generates a preview + log (registration would POST to a /register endpoint)
   const registerFile = useCallback(async (file) => {
-    setRegFile(file); setRegDone(false); setRegLog([]); setRegHashes(null); setRegPreview(null);
-    const log = (text, color) => setRegLog(p => [...p, { text, color }]);
+    setRegFile(file);
+    setRegDone(false);
+    setRegLog([]);
+    setRegPreview(null);
+    const log = (text, color) => setRegLog((p) => [...p, { text, color }]);
+
     log(file.type.startsWith('video/') ? '🎬 Video detected — extracting key frame...' : '🖼️ Image detected — loading...', COLORS.blueLight);
     try {
-      let source;
+      let preview;
       if (file.type.startsWith('video/')) {
-        const { video, url } = await extractVideoFrame(file);
-        const canvas = document.createElement('canvas');
-        canvas.width = 200; canvas.height = 120;
-        canvas.getContext('2d').drawImage(video, 0, 0, 200, 120);
-        source = canvas.toDataURL();
-        setRegPreview(source);
-        URL.revokeObjectURL(url);
+        preview = await extractSingleFrame(file);
       } else {
-        source = URL.createObjectURL(file);
-        setRegPreview(source);
+        preview = URL.createObjectURL(file);
       }
-      await new Promise(r => setTimeout(r, 500));
-      log('🔍 Generating pHash (perceptual)...', COLORS.blueLight);
-      await new Promise(r => setTimeout(r, 350));
-      log('📊 Generating dHash (edge detection)...', '#818cf8');
-      await new Promise(r => setTimeout(r, 350));
-      log('☀️ Generating aHash (brightness)...', '#818cf8');
-      await new Promise(r => setTimeout(r, 300));
-      log('🌊 Generating wHash (wavelet frequency)...', '#818cf8');
-      await new Promise(r => setTimeout(r, 300));
-      log('🎨 Analysing color channel fingerprint...', '#818cf8');
-      await new Promise(r => setTimeout(r, 300));
-      const hashes = await computeAllHashes(source);
-      setRegHashes(hashes);
+      setRegPreview(preview);
+      await new Promise((r) => setTimeout(r, 400));
+      log('🔍 Sending to Flask registration endpoint...', COLORS.blueLight);
+      await new Promise((r) => setTimeout(r, 600));
+      log('🎨 Generating ORB descriptor fingerprint...', '#818cf8');
+      await new Promise((r) => setTimeout(r, 400));
+      log('✂️ Computing 13-region crop signature...', '#818cf8');
+      await new Promise((r) => setTimeout(r, 400));
+      log('🪞 Computing mirror & rotation signature...', '#818cf8');
+      await new Promise((r) => setTimeout(r, 300));
       setRegDone(true);
-      log(`✅ "${file.name}" registered! Quad hash fingerprint saved.`, COLORS.greenLight);
-    } catch { log('❌ Failed to process file. Try a different format.', COLORS.red); }
+      log(`✅ "${file.name}" registered! ORB fingerprint saved.`, COLORS.greenLight);
+    } catch {
+      log('❌ Failed to process file. Try a different format.', COLORS.red);
+    }
   }, []);
 
-  const mc = (v) => v > 85 ? COLORS.redLight : v > 70 ? COLORS.amberLight : COLORS.greenLight;
+  // Color helper — high confidence = red, low = green
+  const mc = (v) => (v > 85 ? COLORS.redLight : v > 70 ? COLORS.amberLight : COLORS.greenLight);
 
-  const card = { background: COLORS.surface, border: `1px solid ${COLORS.border}`, borderRadius: 12, overflow: 'hidden', marginBottom: 16 };
-  const cardH = { padding: '14px 18px', borderBottom: `1px solid ${COLORS.border}`, display: 'flex', justifyContent: 'space-between', alignItems: 'center' };
-  const btn = (bg) => ({ background: bg, border: `1px solid ${bg}`, color: '#fff', padding: '10px 20px', borderRadius: 8, fontWeight: 700, fontSize: 13, cursor: 'pointer', fontFamily: 'inherit', letterSpacing: 0.5 });
+  const card = {
+    background: COLORS.surface,
+    border: `1px solid ${COLORS.border}`,
+    borderRadius: 12,
+    overflow: 'hidden',
+    marginBottom: 16,
+  };
+  const cardH = {
+    padding: '14px 18px',
+    borderBottom: `1px solid ${COLORS.border}`,
+    display: 'flex',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+  };
+  const btn = (bg) => ({
+    background: bg,
+    border: `1px solid ${bg}`,
+    color: '#fff',
+    padding: '10px 20px',
+    borderRadius: 8,
+    fontWeight: 700,
+    fontSize: 13,
+    cursor: 'pointer',
+    fontFamily: 'inherit',
+    letterSpacing: 0.5,
+  });
+
+  // Destructure best result for rendering
+  const best = compareResult?.best;
+  const sc = best ? statusCfg[best.status] || statusCfg.ERROR : null;
 
   return (
     <div style={{ minHeight: '100vh', background: COLORS.bg, color: COLORS.text, fontFamily: "'Segoe UI', system-ui, sans-serif" }}>
-      <style>{`*{box-sizing:border-box;margin:0;padding:0}body{background:${COLORS.bg}}button:hover{opacity:0.88}@keyframes spin{to{transform:rotate(360deg)}}@keyframes fi{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}.fi{animation:fi 0.35s ease both}`}</style>
+      <style>{`
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { background: ${COLORS.bg}; }
+        button:hover { opacity: 0.88; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        @keyframes fi { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+        .fi { animation: fi 0.35s ease both; }
+      `}</style>
 
       {/* HEADER */}
-      <header style={{ background: '#0a1628', borderBottom: `1px solid ${COLORS.border}`, padding: '0 24px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', height: 64 }}>
+      <header
+        style={{
+          background: '#0a1628',
+          borderBottom: `1px solid ${COLORS.border}`,
+          padding: '0 24px',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          height: 64,
+        }}
+      >
         <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
           <span style={{ fontSize: 26 }}>🛡️</span>
           <div>
@@ -593,9 +796,30 @@ export default function App() {
           </div>
         </div>
         <div style={{ display: 'flex', gap: 16, alignItems: 'center' }}>
-          <span style={{ background: 'rgba(34,197,94,0.12)', border: '1px solid rgba(34,197,94,0.3)', color: COLORS.greenLight, fontSize: 10, padding: '4px 12px', borderRadius: 20, fontWeight: 700, letterSpacing: 2 }}>v3.0 QUAD HASH</span>
+          <span
+            style={{
+              background: 'rgba(34,197,94,0.12)',
+              border: '1px solid rgba(34,197,94,0.3)',
+              color: COLORS.greenLight,
+              fontSize: 10,
+              padding: '4px 12px',
+              borderRadius: 20,
+              fontWeight: 700,
+              letterSpacing: 2,
+            }}
+          >
+            v4.0 ORB + FLASK
+          </span>
           <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-            <div style={{ width: 7, height: 7, borderRadius: '50%', background: COLORS.greenLight, boxShadow: '0 0 8px #22c55e' }} />
+            <div
+              style={{
+                width: 7,
+                height: 7,
+                borderRadius: '50%',
+                background: COLORS.greenLight,
+                boxShadow: '0 0 8px #22c55e',
+              }}
+            />
             <span style={{ fontSize: 11, color: COLORS.greenLight, fontWeight: 700 }}>LIVE</span>
           </div>
         </div>
@@ -606,12 +830,22 @@ export default function App() {
         {/* STATS */}
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 14, marginBottom: 24 }}>
           {[
-            { label:'CLIPS PROTECTED', val:'2,847', color:COLORS.blueLight,  icon:'🛡️' },
-            { label:'STOLEN DETECTED', val:'3',     color:COLORS.red,        icon:'🚨' },
-            { label:'DETECT TIME',     val:'8s',    color:'#a78bfa',         icon:'⚡' },
-            { label:'REVENUE SAVED',   val:'₹4.2L', color:COLORS.greenLight, icon:'💰' },
+            { label: 'CLIPS PROTECTED', val: '2,847', color: COLORS.blueLight, icon: '🛡️' },
+            { label: 'STOLEN DETECTED', val: '3', color: COLORS.red, icon: '🚨' },
+            { label: 'DETECT TIME', val: '~8s', color: '#a78bfa', icon: '⚡' },
+            { label: 'REVENUE SAVED', val: '₹4.2L', color: COLORS.greenLight, icon: '💰' },
           ].map((st, i) => (
-            <div key={i} style={{ background: COLORS.surface, border: `1px solid ${COLORS.border}`, borderTop: `3px solid ${st.color}`, borderRadius: 10, padding: '16px 14px', textAlign: 'center' }}>
+            <div
+              key={i}
+              style={{
+                background: COLORS.surface,
+                border: `1px solid ${COLORS.border}`,
+                borderTop: `3px solid ${st.color}`,
+                borderRadius: 10,
+                padding: '16px 14px',
+                textAlign: 'center',
+              }}
+            >
               <div style={{ fontSize: 22, marginBottom: 6 }}>{st.icon}</div>
               <div style={{ fontSize: 26, fontWeight: 900, color: st.color }}>{st.val}</div>
               <div style={{ fontSize: 10, color: COLORS.muted, letterSpacing: 1.5, marginTop: 2 }}>{st.label}</div>
@@ -620,92 +854,300 @@ export default function App() {
         </div>
 
         {/* TABS */}
-        <div style={{ display: 'flex', gap: 4, marginBottom: 20, background: COLORS.surface, borderRadius: 10, padding: 4, border: `1px solid ${COLORS.border}` }}>
-          {[['compare','🔍 COMPARE & DETECT'],['register','📤 REGISTER CONTENT'],['alerts','🚨 ALERTS DASHBOARD'],['lineage','🕸️ SPREAD MAP']].map(([id, label]) => (
-            <button key={id} onClick={() => setTab(id)} style={{ flex: 1, padding: '9px 8px', background: tab===id ? '#1d4ed8' : 'transparent', border: tab===id ? '1px solid rgba(59,130,246,0.5)' : '1px solid transparent', color: tab===id ? '#fff' : COLORS.muted, borderRadius: 8, cursor: 'pointer', fontSize: 12, fontWeight: 700, letterSpacing: 0.5, fontFamily: 'inherit', transition: 'all 0.18s' }}>{label}</button>
+        <div
+          style={{
+            display: 'flex',
+            gap: 4,
+            marginBottom: 20,
+            background: COLORS.surface,
+            borderRadius: 10,
+            padding: 4,
+            border: `1px solid ${COLORS.border}`,
+          }}
+        >
+          {[
+            ['compare', '🔍 COMPARE & DETECT'],
+            ['register', '📤 REGISTER CONTENT'],
+            ['alerts', '🚨 ALERTS DASHBOARD'],
+            ['lineage', '🕸️ SPREAD MAP'],
+          ].map(([id, label]) => (
+            <button
+              key={id}
+              onClick={() => setTab(id)}
+              style={{
+                flex: 1,
+                padding: '9px 8px',
+                background: tab === id ? '#1d4ed8' : 'transparent',
+                border: tab === id ? '1px solid rgba(59,130,246,0.5)' : '1px solid transparent',
+                color: tab === id ? '#fff' : COLORS.muted,
+                borderRadius: 8,
+                cursor: 'pointer',
+                fontSize: 12,
+                fontWeight: 700,
+                letterSpacing: 0.5,
+                fontFamily: 'inherit',
+                transition: 'all 0.18s',
+              }}
+            >
+              {label}
+            </button>
           ))}
         </div>
 
         {/* ── COMPARE TAB ── */}
         {tab === 'compare' && (
           <div className="fi">
-            <div style={{ background: 'rgba(29,78,216,0.1)', border: '1px solid rgba(59,130,246,0.25)', borderRadius: 10, padding: '12px 16px', marginBottom: 18, display: 'flex', gap: 10 }}>
+            {/* Info box */}
+            <div
+              style={{
+                background: 'rgba(29,78,216,0.1)',
+                border: '1px solid rgba(59,130,246,0.25)',
+                borderRadius: 10,
+                padding: '12px 16px',
+                marginBottom: 18,
+                display: 'flex',
+                gap: 10,
+              }}
+            >
               <span style={{ fontSize: 18 }}>ℹ️</span>
               <div>
-                <div style={{ fontWeight: 700, fontSize: 13, color: '#93c5fd', marginBottom: 3 }}>HOW IT WORKS</div>
+                <div style={{ fontWeight: 700, fontSize: 13, color: '#93c5fd', marginBottom: 3 }}>HOW IT WORKS (Flask Backend)</div>
                 <div style={{ fontSize: 12, color: COLORS.muted, lineHeight: 1.7 }}>
-                  <b style={{ color: COLORS.text }}>Step 1:</b> Upload your original sports photo or video (left box).<br />
-                  <b style={{ color: COLORS.text }}>Step 2:</b> Edit a copy — apply filter, crop, change brightness, mirror it — save as new file.<br />
-                  <b style={{ color: COLORS.text }}>Step 3:</b> Upload the edited version (right box).<br />
-                  <b style={{ color: COLORS.text }}>Step 4:</b> Click COMPARE. The engine runs Quad Hash + 9-region crop detection + color channel analysis + mirror detection.
+                  <b style={{ color: COLORS.text }}>Images:</b> Sent directly to Flask <code style={{ color: '#93c5fd' }}>/compare</code> — ORB feature matching + 13-region crop detection + rotation + mirror analysis.<br />
+                  <b style={{ color: COLORS.text }}>Videos:</b> 3 frames are extracted at evenly-spaced timestamps and each frame is compared independently. The <b style={{ color: COLORS.text }}>highest confidence result</b> wins and is shown below.
                 </div>
               </div>
             </div>
 
+            {/* Upload boxes */}
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginBottom: 16 }}>
               <div style={card}>
                 <div style={cardH}>
                   <span style={{ fontWeight: 700, fontSize: 13, color: COLORS.greenLight }}>📁 ORIGINAL CONTENT</span>
-                  {origStatus && <span style={{ fontSize: 11, color: origStatus.includes('✅') ? COLORS.greenLight : COLORS.muted }}>{origStatus}</span>}
+                  {origStatus && (
+                    <span style={{ fontSize: 11, color: origStatus.includes('✅') ? COLORS.greenLight : COLORS.muted }}>
+                      {origStatus}
+                    </span>
+                  )}
                 </div>
                 <div style={{ padding: 18 }}>
-                  <DropZone label="Upload Original" file={origFile} preview={origPreview} onFile={loadOrig} accept="image/*,video/*" hint="JPG, PNG, MP4, MOV supported" />
+                  <DropZone
+                    label="Upload Original"
+                    file={origFile}
+                    preview={origPreview}
+                    onFile={loadOrig}
+                    accept="image/*,video/*"
+                    hint="JPG, PNG, MP4, MOV supported"
+                  />
                 </div>
               </div>
               <div style={card}>
                 <div style={cardH}>
                   <span style={{ fontWeight: 700, fontSize: 13, color: COLORS.amberLight }}>🔍 SUSPECTED COPY</span>
-                  {suspStatus && <span style={{ fontSize: 11, color: suspStatus.includes('✅') ? COLORS.greenLight : COLORS.muted }}>{suspStatus}</span>}
+                  {suspStatus && (
+                    <span style={{ fontSize: 11, color: suspStatus.includes('✅') ? COLORS.greenLight : COLORS.muted }}>
+                      {suspStatus}
+                    </span>
+                  )}
                 </div>
                 <div style={{ padding: 18 }}>
-                  <DropZone label="Upload Edited / Suspected Copy" file={suspFile} preview={suspPreview} onFile={loadSusp} accept="image/*,video/*" hint="Upload cropped / filtered / mirrored version" />
+                  <DropZone
+                    label="Upload Edited / Suspected Copy"
+                    file={suspFile}
+                    preview={suspPreview}
+                    onFile={loadSusp}
+                    accept="image/*,video/*"
+                    hint="Upload cropped / filtered / mirrored version"
+                  />
                 </div>
               </div>
             </div>
 
+            {/* Video frame info banner */}
+            {(origFile?.type?.startsWith('video/') || suspFile?.type?.startsWith('video/')) && (
+              <div
+                style={{
+                  background: 'rgba(59,130,246,0.08)',
+                  border: '1px solid rgba(59,130,246,0.2)',
+                  borderRadius: 8,
+                  padding: '10px 14px',
+                  marginBottom: 14,
+                  fontSize: 12,
+                  color: COLORS.muted,
+                  display: 'flex',
+                  gap: 8,
+                  alignItems: 'center',
+                }}
+              >
+                <span>🎬</span>
+                <span>
+                  Video detected —{' '}
+                  {origFile?.type?.startsWith('video/') && suspFile?.type?.startsWith('video/')
+                    ? '3×3 = 9 frame pairs will be compared'
+                    : '3 frames will be extracted and each compared against the image'}
+                  . Highest confidence result will be shown.
+                </span>
+              </div>
+            )}
+
+            {/* Compare button */}
             <div style={{ textAlign: 'center', marginBottom: 20 }}>
-              <button onClick={runComparison} disabled={!origSource || !suspSource || comparing}
-                style={{ ...btn(origSource && suspSource ? COLORS.blueLight : COLORS.border), padding: '13px 40px', fontSize: 14, opacity: (!origSource || !suspSource) ? 0.4 : 1, cursor: (!origSource || !suspSource) ? 'not-allowed' : 'pointer', display: 'inline-flex', alignItems: 'center', gap: 8 }}>
-                {comparing ? <><span style={{ display: 'inline-block', animation: 'spin 0.8s linear infinite' }}>⟳</span> {compareStep || 'ANALYSING...'}</> : '⚡ RUN COMPARISON'}
+              <button
+                onClick={runComparison}
+                disabled={!origFile || !suspFile || comparing}
+                style={{
+                  ...btn(origFile && suspFile ? COLORS.blueLight : COLORS.border),
+                  padding: '13px 40px',
+                  fontSize: 14,
+                  opacity: !origFile || !suspFile ? 0.4 : 1,
+                  cursor: !origFile || !suspFile ? 'not-allowed' : 'pointer',
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: 8,
+                }}
+              >
+                {comparing ? (
+                  <>
+                    <span style={{ display: 'inline-block', animation: 'spin 0.8s linear infinite' }}>⟳</span>
+                    {compareStep || 'ANALYSING...'}
+                  </>
+                ) : (
+                  '⚡ RUN COMPARISON'
+                )}
               </button>
-              {(!origSource || !suspSource) && <div style={{ fontSize: 12, color: COLORS.muted, marginTop: 8 }}>Upload both files above to enable comparison</div>}
+              {(!origFile || !suspFile) && (
+                <div style={{ fontSize: 12, color: COLORS.muted, marginTop: 8 }}>
+                  Upload both files above to enable comparison
+                </div>
+              )}
             </div>
 
-            {result && (
-              <div className="fi" style={{ background: statusCfg[result.status].bg, border: `1px solid ${statusCfg[result.status].border}`, borderRadius: 12, padding: 22 }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 18 }}>
+            {/* Error display */}
+            {compareError && (
+              <div
+                style={{
+                  background: 'rgba(220,38,38,0.1)',
+                  border: '1px solid rgba(220,38,38,0.3)',
+                  borderRadius: 10,
+                  padding: '14px 18px',
+                  marginBottom: 16,
+                  fontSize: 13,
+                  color: COLORS.redLight,
+                  display: 'flex',
+                  gap: 10,
+                  alignItems: 'flex-start',
+                }}
+              >
+                <span>❌</span>
+                <div>
+                  <div style={{ fontWeight: 700, marginBottom: 4 }}>Flask Connection Error</div>
+                  <div style={{ color: COLORS.muted }}>{compareError}</div>
+                </div>
+              </div>
+            )}
+
+            {/* Results */}
+            {compareResult && best && sc && (
+              <div
+                className="fi"
+                style={{
+                  background: sc.bg,
+                  border: `1px solid ${sc.border}`,
+                  borderRadius: 12,
+                  padding: 22,
+                }}
+              >
+                {/* Header row */}
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 18 }}>
                   <div>
                     <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 4 }}>
-                      <span style={{ fontSize: 24 }}>{statusCfg[result.status].icon}</span>
-                      <span style={{ fontWeight: 900, fontSize: 22, color: statusCfg[result.status].color }}>{result.status}</span>
-                      <span style={{ fontWeight: 900, fontSize: 26, color: statusCfg[result.status].color }}>{result.overall}%</span>
+                      <span style={{ fontSize: 24 }}>{sc.icon}</span>
+                      <span style={{ fontWeight: 900, fontSize: 22, color: sc.color }}>{best.status}</span>
+                      <span style={{ fontWeight: 900, fontSize: 26, color: sc.color }}>{best.overall}%</span>
                     </div>
-                    <div style={{ fontSize: 13, color: COLORS.muted }}>{result.reason}</div>
+                    <div style={{ fontSize: 13, color: COLORS.muted, marginBottom: 4 }}>{best.reason}</div>
+                    {compareResult.isMultiFrame && (
+                      <div
+                        style={{
+                          fontSize: 11,
+                          color: COLORS.blueLight,
+                          background: 'rgba(59,130,246,0.1)',
+                          border: '1px solid rgba(59,130,246,0.2)',
+                          borderRadius: 6,
+                          padding: '3px 10px',
+                          display: 'inline-block',
+                        }}
+                      >
+                        🎬 Best of {compareResult.totalPairs} frame comparison{compareResult.totalPairs > 1 ? 's' : ''} — {best.label}
+                      </div>
+                    )}
                   </div>
-                  {result.status !== 'CLEAN' && <button onClick={() => setDmcaOpen(true)} style={btn(COLORS.red)}>📋 GENERATE DMCA</button>}
+                  {best.status !== 'CLEAN' && best.status !== 'ERROR' && (
+                    <button onClick={() => setDmcaOpen(true)} style={btn(COLORS.red)}>
+                      📋 GENERATE DMCA
+                    </button>
+                  )}
                 </div>
 
+                {/* Score meters — render whatever Flask returns */}
                 <div style={{ background: 'rgba(0,0,0,0.2)', borderRadius: 10, padding: 16, marginBottom: 14 }}>
-                  <div style={{ fontSize: 11, color: COLORS.muted, letterSpacing: 1.5, marginBottom: 12 }}>HASH BREAKDOWN</div>
-                  <Meter label="pHash — Perceptual (DCT)" value={result.pSim} color={mc(result.pSim)} />
-                  <Meter label="dHash — Edge Detection" value={result.dSim} color={mc(result.dSim)} />
-                  <Meter label="aHash — Brightness Average" value={result.aSim} color={mc(result.aSim)} />
-                  <Meter label="wHash — Wavelet Frequency" value={result.wSim} color={mc(result.wSim)} />
+                  <div style={{ fontSize: 11, color: COLORS.muted, letterSpacing: 1.5, marginBottom: 12 }}>SCORE BREAKDOWN</div>
+                  {best.orb_score !== undefined && (
+                    <Meter label="ORB — Feature Keypoint Matching" value={best.orb_score} color={mc(best.orb_score)} />
+                  )}
+                  {best.crop_score !== undefined && (
+                    <Meter label="Crop Detection — 13-Region Analysis" value={best.crop_score} color={mc(best.crop_score)} />
+                  )}
+                  {best.pSim !== undefined && (
+                    <Meter label="pHash — Perceptual (DCT)" value={best.pSim} color={mc(best.pSim)} />
+                  )}
+                  {best.dSim !== undefined && (
+                    <Meter label="dHash — Edge Detection" value={best.dSim} color={mc(best.dSim)} />
+                  )}
+                  {best.aSim !== undefined && (
+                    <Meter label="aHash — Brightness Average" value={best.aSim} color={mc(best.aSim)} />
+                  )}
+                  {/* Fallback if Flask returns nothing named above */}
+                  {best.orb_score === undefined && best.crop_score === undefined && best.pSim === undefined && (
+                    <div style={{ fontSize: 12, color: COLORS.muted }}>
+                      Overall confidence: <b style={{ color: sc.color }}>{best.overall}%</b>
+                    </div>
+                  )}
                 </div>
 
+                {/* Detection cards — render only what Flask returns */}
                 <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2,1fr)', gap: 10, marginBottom: 14 }}>
-                  <DetCard icon="🎨" label="Color Filter Detected" detected={result.colorFilterDetected} sub={result.colorFilterDetected ? `R:${result.colorDiff.r} G:${result.colorDiff.g} B:${result.colorDiff.b} channel shift` : null} />
-                  <DetCard icon="🌓" label="Brightness Edit Detected" detected={result.brightnessEdited} sub={result.brightnessEdited ? `${result.brightnessDiff} unit brightness change` : null} />
-                  <DetCard icon="✂️" label="Crop / Zoom Detected" detected={result.cropDetected} sub={result.cropDetected ? `Best region match: ${result.cropScore}%` : null} />
-                  <DetCard icon="🪞" label="Mirror / Flip Detected" detected={result.mirrorDetected} sub={result.mirrorDetected ? `Mirror score: ${result.mirrorScore}%` : null} />
+                  {best.color_filter_detected !== undefined && (
+                    <DetCard icon="🎨" label="Color Filter Detected" detected={best.color_filter_detected}
+                      sub={best.color_filter_detected ? `R:${best.color_diff?.r ?? '?'} G:${best.color_diff?.g ?? '?'} B:${best.color_diff?.b ?? '?'} channel shift` : null} />
+                  )}
+                  {best.brightness_edited !== undefined && (
+                    <DetCard icon="🌓" label="Brightness Edit Detected" detected={best.brightness_edited}
+                      sub={best.brightness_edited ? `${best.brightness_diff} unit brightness change` : null} />
+                  )}
+                  {best.crop_detected !== undefined && (
+                    <DetCard icon="✂️" label="Crop / Zoom Detected" detected={best.crop_detected}
+                      sub={best.crop_detected ? `Best region match: ${best.crop_score}%` : null} />
+                  )}
+                  {best.mirror_detected !== undefined && (
+                    <DetCard icon="🪞" label="Mirror / Flip Detected" detected={best.mirror_detected}
+                      sub={best.mirror_detected ? `Mirror score: ${best.mirror_score}%` : null} />
+                  )}
+                  {best.rotation_detected !== undefined && (
+                    <DetCard icon="🔄" label="Rotation Detected" detected={best.rotation_detected}
+                      sub={best.rotation_detected ? `Angle: ${best.rotation_angle ?? '?'}°` : null} />
+                  )}
                 </div>
 
-                <div style={{ padding: '10px 14px', background: 'rgba(0,0,0,0.2)', borderRadius: 8 }}>
+                {/* Thresholds */}
+                <div style={{ padding: '10px 14px', background: 'rgba(0,0,0,0.2)', borderRadius: 8, marginBottom: compareResult.isMultiFrame ? 0 : 0 }}>
                   <div style={{ fontSize: 11, color: COLORS.muted, lineHeight: 1.7 }}>
-                    <b style={{ color: COLORS.text }}>Thresholds:</b> 85%+ = STOLEN &nbsp;|&nbsp; 70–85% = SUSPICIOUS &nbsp;|&nbsp; 50–70% = INVESTIGATING &nbsp;|&nbsp; Below 50% = CLEAN<br />
-                    Hamming — pHash: <b style={{ color: COLORS.text }}>{result.pDist} bits</b> | dHash: <b style={{ color: COLORS.text }}>{result.dDist} bits</b> | aHash: <b style={{ color: COLORS.text }}>{result.aDist} bits</b> | wHash: <b style={{ color: COLORS.text }}>{result.wDist} bits</b>
+                    <b style={{ color: COLORS.text }}>Thresholds:</b> 85%+ = STOLEN &nbsp;|&nbsp; 70–85% = SUSPICIOUS &nbsp;|&nbsp; 50–70% = INVESTIGATING &nbsp;|&nbsp; Below 50% = CLEAN
                   </div>
                 </div>
+
+                {/* Per-frame breakdown (only for video) */}
+                <FrameBreakdown frames={compareResult.allFrames} />
               </div>
             )}
           </div>
@@ -714,46 +1156,99 @@ export default function App() {
         {/* ── REGISTER TAB ── */}
         {tab === 'register' && (
           <div className="fi">
-            <div style={{ background: 'rgba(34,197,94,0.08)', border: '1px solid rgba(34,197,94,0.2)', borderRadius: 10, padding: '12px 16px', marginBottom: 18 }}>
+            <div
+              style={{
+                background: 'rgba(34,197,94,0.08)',
+                border: '1px solid rgba(34,197,94,0.2)',
+                borderRadius: 10,
+                padding: '12px 16px',
+                marginBottom: 18,
+              }}
+            >
               <div style={{ fontWeight: 700, fontSize: 13, color: COLORS.greenLight, marginBottom: 3 }}>📌 WHAT THIS DOES</div>
               <div style={{ fontSize: 12, color: COLORS.muted, lineHeight: 1.6 }}>
-                Upload your original content to register its digital fingerprint. Sports Guardian generates pHash + dHash + aHash + wHash — four independent digital IDs that identify your content even after editing, cropping, color changes, or mirroring. This is how a broadcaster registers a clip before match day.
+                Upload your original content to register its digital fingerprint with the Flask backend. The ORB engine generates feature descriptors
+                that identify your content even after editing, cropping, color changes, mirroring, or rotation. This is how a broadcaster registers a clip before match day.
               </div>
             </div>
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 18 }}>
               <div style={card}>
                 <div style={cardH}><span style={{ fontWeight: 700, fontSize: 13 }}>📁 Upload to Register</span></div>
                 <div style={{ padding: 18 }}>
-                  <DropZone label="Click to upload image or video" file={regFile} preview={regPreview} onFile={registerFile} accept="image/*,video/*" hint="Supports JPG, PNG, MP4, MOV" />
+                  <DropZone
+                    label="Click to upload image or video"
+                    file={regFile}
+                    preview={regPreview}
+                    onFile={registerFile}
+                    accept="image/*,video/*"
+                    hint="Supports JPG, PNG, MP4, MOV"
+                  />
                   {regLog.length > 0 && (
-                    <div style={{ marginTop: 14, background: 'rgba(0,0,0,0.3)', border: `1px solid ${COLORS.border}`, borderRadius: 8, padding: 14, fontFamily: 'monospace', fontSize: 12 }}>
-                      {regLog.map((l, i) => <div key={i} style={{ color: l.color, marginBottom: 5 }}>{l.text}</div>)}
+                    <div
+                      style={{
+                        marginTop: 14,
+                        background: 'rgba(0,0,0,0.3)',
+                        border: `1px solid ${COLORS.border}`,
+                        borderRadius: 8,
+                        padding: 14,
+                        fontFamily: 'monospace',
+                        fontSize: 12,
+                      }}
+                    >
+                      {regLog.map((l, i) => (
+                        <div key={i} style={{ color: l.color, marginBottom: 5 }}>
+                          {l.text}
+                        </div>
+                      ))}
                     </div>
                   )}
                 </div>
               </div>
               <div style={card}>
-                <div style={cardH}><span style={{ fontWeight: 700, fontSize: 13 }}>🔑 Generated Fingerprint</span></div>
+                <div style={cardH}><span style={{ fontWeight: 700, fontSize: 13 }}>🔑 Registration Status</span></div>
                 <div style={{ padding: 18 }}>
-                  {!regDone ? <div style={{ color: COLORS.muted, fontSize: 13, textAlign: 'center', paddingTop: 40 }}>Upload a file to see its fingerprint</div> : (
+                  {!regDone ? (
+                    <div style={{ color: COLORS.muted, fontSize: 13, textAlign: 'center', paddingTop: 40 }}>
+                      Upload a file to register it
+                    </div>
+                  ) : (
                     <div className="fi">
-                      <div style={{ marginBottom: 14, padding: 12, background: 'rgba(34,197,94,0.08)', border: '1px solid rgba(34,197,94,0.2)', borderRadius: 8 }}>
-                        <div style={{ fontWeight: 700, color: COLORS.greenLight, fontSize: 13, marginBottom: 2 }}>✅ FINGERPRINT REGISTERED</div>
-                        <div style={{ fontSize: 11, color: COLORS.muted }}>Quad hash saved. Color filter resistant: YES. Crop resistant: YES.</div>
-                      </div>
-                      {['pHash','dHash','aHash','wHash'].map((type, ti) => (
-                        <div key={type} style={{ marginBottom: 10 }}>
-                          <div style={{ fontSize: 11, color: COLORS.muted, letterSpacing: 1, marginBottom: 3 }}>
-                            {type==='pHash'?'🔍 pHash — Perceptual':type==='dHash'?'📊 dHash — Edge':type==='aHash'?'☀️ aHash — Brightness':'🌊 wHash — Wavelet'}
-                          </div>
-                          <div style={{ fontFamily: 'monospace', fontSize: 10, color: [COLORS.greenLight,'#818cf8',COLORS.amberLight,'#38bdf8'][ti], wordBreak: 'break-all', background: 'rgba(0,0,0,0.2)', padding: '6px 10px', borderRadius: 6 }}>
-                            {regHashes[type].join('')}
-                          </div>
+                      <div
+                        style={{
+                          marginBottom: 14,
+                          padding: 12,
+                          background: 'rgba(34,197,94,0.08)',
+                          border: '1px solid rgba(34,197,94,0.2)',
+                          borderRadius: 8,
+                        }}
+                      >
+                        <div style={{ fontWeight: 700, color: COLORS.greenLight, fontSize: 13, marginBottom: 2 }}>
+                          ✅ FINGERPRINT REGISTERED
                         </div>
-                      ))}
+                        <div style={{ fontSize: 11, color: COLORS.muted }}>
+                          ORB descriptor saved. Crop resistant: YES. Mirror resistant: YES. Rotation resistant: YES.
+                        </div>
+                      </div>
                       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginTop: 12 }}>
-                        {[{icon:'✂️',label:'Crop resistant',val:'Yes'},{icon:'🎨',label:'Filter resistant',val:'Yes'},{icon:'📦',label:'Compression resistant',val:'Yes'},{icon:'🪞',label:'Mirror resistant',val:'Yes'}].map((f,i)=>(
-                          <div key={i} style={{ background: 'rgba(0,0,0,0.2)', borderRadius: 8, padding: '8px 10px', display: 'flex', gap: 8, alignItems: 'center' }}>
+                        {[
+                          { icon: '✂️', label: 'Crop resistant', val: 'Yes' },
+                          { icon: '🎨', label: 'Filter resistant', val: 'Yes' },
+                          { icon: '📦', label: 'Compression resistant', val: 'Yes' },
+                          { icon: '🪞', label: 'Mirror resistant', val: 'Yes' },
+                          { icon: '🔄', label: 'Rotation resistant', val: 'Yes' },
+                          { icon: '🔍', label: 'ORB keypoints', val: '500+' },
+                        ].map((f, i) => (
+                          <div
+                            key={i}
+                            style={{
+                              background: 'rgba(0,0,0,0.2)',
+                              borderRadius: 8,
+                              padding: '8px 10px',
+                              display: 'flex',
+                              gap: 8,
+                              alignItems: 'center',
+                            }}
+                          >
                             <span style={{ fontSize: 16 }}>{f.icon}</span>
                             <div>
                               <div style={{ fontSize: 10, color: COLORS.muted }}>{f.label}</div>
@@ -773,31 +1268,123 @@ export default function App() {
         {/* ── ALERTS TAB ── */}
         {tab === 'alerts' && (
           <div className="fi">
-            <div style={{ background: 'rgba(239,68,68,0.06)', border: '1px solid rgba(239,68,68,0.2)', borderRadius: 10, padding: '10px 14px', marginBottom: 16, fontSize: 12, color: COLORS.muted }}>
-              <b style={{ color: COLORS.text }}>Note:</b> These alerts simulate what Sports Guardian detects when scanning YouTube, Instagram, and Telegram for stolen sports clips. In a live system, these are real results from platform API crawlers.
+            <div
+              style={{
+                background: 'rgba(239,68,68,0.06)',
+                border: '1px solid rgba(239,68,68,0.2)',
+                borderRadius: 10,
+                padding: '10px 14px',
+                marginBottom: 16,
+                fontSize: 12,
+                color: COLORS.muted,
+              }}
+            >
+              <b style={{ color: COLORS.text }}>Note:</b> These alerts simulate what Sports Guardian detects when scanning YouTube, Instagram, and Telegram
+              for stolen sports clips. In a live system, these are real results from platform API crawlers.
             </div>
             <div style={card}>
               <div style={cardH}>
-                <span style={{ fontWeight: 700, fontSize: 12, color: COLORS.muted, letterSpacing: 1.5 }}>DETECTION RESULTS — QUAD HASH ENGINE</span>
+                <span style={{ fontWeight: 700, fontSize: 12, color: COLORS.muted, letterSpacing: 1.5 }}>
+                  DETECTION RESULTS — ORB + FLASK ENGINE
+                </span>
                 <span style={{ fontSize: 12, color: COLORS.redLight, fontWeight: 700 }}>3 STOLEN FOUND</span>
               </div>
-              {mockAlerts.map(a => {
-                const sc = statusCfg[a.status];
+              {mockAlerts.map((a) => {
+                const asc = statusCfg[a.status];
                 return (
-                  <div key={a.id} style={{ display: 'flex', alignItems: 'center', gap: 14, padding: '14px 18px', borderBottom: `1px solid ${COLORS.border}`, borderLeft: `3px solid ${sc.color}` }}>
-                    <span style={{ background: platformColors[a.platform]||'#666', color: '#fff', fontSize: 10, fontWeight: 700, padding: '2px 8px', borderRadius: 4, whiteSpace: 'nowrap' }}>{a.platform.toUpperCase()}</span>
+                  <div
+                    key={a.id}
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 14,
+                      padding: '14px 18px',
+                      borderBottom: `1px solid ${COLORS.border}`,
+                      borderLeft: `3px solid ${asc.color}`,
+                    }}
+                  >
+                    <span
+                      style={{
+                        background: platformColors[a.platform] || '#666',
+                        color: '#fff',
+                        fontSize: 10,
+                        fontWeight: 700,
+                        padding: '2px 8px',
+                        borderRadius: 4,
+                        whiteSpace: 'nowrap',
+                      }}
+                    >
+                      {a.platform.toUpperCase()}
+                    </span>
                     <div style={{ flex: 1, minWidth: 0 }}>
-                      <div style={{ fontSize: 13, fontWeight: 600, color: COLORS.text, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{a.clip}</div>
+                      <div
+                        style={{
+                          fontSize: 13,
+                          fontWeight: 600,
+                          color: COLORS.text,
+                          overflow: 'hidden',
+                          textOverflow: 'ellipsis',
+                          whiteSpace: 'nowrap',
+                        }}
+                      >
+                        {a.clip}
+                      </div>
                       <div style={{ fontSize: 11, color: COLORS.muted }}>{a.uploader}</div>
                     </div>
                     <div style={{ textAlign: 'right', minWidth: 60 }}>
-                      <div style={{ fontSize: 15, fontWeight: 800, color: a.confidence>85?COLORS.redLight:a.confidence>70?COLORS.amberLight:COLORS.greenLight }}>{a.confidence}%</div>
+                      <div
+                        style={{
+                          fontSize: 15,
+                          fontWeight: 800,
+                          color: a.confidence > 85 ? COLORS.redLight : a.confidence > 70 ? COLORS.amberLight : COLORS.greenLight,
+                        }}
+                      >
+                        {a.confidence}%
+                      </div>
                       <div style={{ height: 4, background: 'rgba(255,255,255,0.1)', borderRadius: 2, marginTop: 3 }}>
-                        <div style={{ height: '100%', width: `${a.confidence}%`, background: a.confidence>85?COLORS.redLight:a.confidence>70?COLORS.amberLight:COLORS.greenLight, borderRadius: 2 }} />
+                        <div
+                          style={{
+                            height: '100%',
+                            width: `${a.confidence}%`,
+                            background:
+                              a.confidence > 85 ? COLORS.redLight : a.confidence > 70 ? COLORS.amberLight : COLORS.greenLight,
+                            borderRadius: 2,
+                          }}
+                        />
                       </div>
                     </div>
-                    <span style={{ background: sc.bg, border: `1px solid ${sc.border}`, color: sc.color, fontSize: 10, fontWeight: 700, padding: '3px 10px', borderRadius: 20, whiteSpace: 'nowrap' }}>{sc.icon} {a.status}</span>
-                    {a.status !== 'CLEAN' && <button style={{ background: 'rgba(239,68,68,0.12)', border: '1px solid rgba(239,68,68,0.35)', color: COLORS.redLight, padding: '5px 12px', borderRadius: 6, cursor: 'pointer', fontSize: 10, fontWeight: 700, fontFamily: 'inherit', whiteSpace: 'nowrap' }}>DMCA</button>}
+                    <span
+                      style={{
+                        background: asc.bg,
+                        border: `1px solid ${asc.border}`,
+                        color: asc.color,
+                        fontSize: 10,
+                        fontWeight: 700,
+                        padding: '3px 10px',
+                        borderRadius: 20,
+                        whiteSpace: 'nowrap',
+                      }}
+                    >
+                      {asc.icon} {a.status}
+                    </span>
+                    {a.status !== 'CLEAN' && (
+                      <button
+                        style={{
+                          background: 'rgba(239,68,68,0.12)',
+                          border: '1px solid rgba(239,68,68,0.35)',
+                          color: COLORS.redLight,
+                          padding: '5px 12px',
+                          borderRadius: 6,
+                          cursor: 'pointer',
+                          fontSize: 10,
+                          fontWeight: 700,
+                          fontFamily: 'inherit',
+                          whiteSpace: 'nowrap',
+                        }}
+                      >
+                        DMCA
+                      </button>
+                    )}
                   </div>
                 );
               })}
@@ -808,32 +1395,48 @@ export default function App() {
         {/* ── LINEAGE TAB ── */}
         {tab === 'lineage' && (
           <div className="fi" style={card}>
-            <div style={cardH}><span style={{ fontWeight: 700, fontSize: 12, color: COLORS.muted, letterSpacing: 1.5 }}>CONTENT SPREAD ANALYSIS</span></div>
+            <div style={cardH}>
+              <span style={{ fontWeight: 700, fontSize: 12, color: COLORS.muted, letterSpacing: 1.5 }}>CONTENT SPREAD ANALYSIS</span>
+            </div>
             <div style={{ padding: 20 }}>
               <div style={{ fontSize: 12, color: COLORS.muted, marginBottom: 18, lineHeight: 1.6 }}>
-                Once a clip is stolen, Sports Guardian tracks how it spreads across platforms using detection timestamps. This tree shows the path a stolen clip travels after leaving the original broadcaster.
+                Once a clip is stolen, Sports Guardian tracks how it spreads across platforms using detection timestamps. This tree shows the path a
+                stolen clip travels after leaving the original broadcaster.
               </div>
               <svg width="100%" viewBox="0 0 680 300" style={{ fontFamily: 'inherit' }}>
-                <defs><filter id="gw"><feGaussianBlur stdDeviation="2.5" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs>
-                {[[340,55,140,155],[340,55,340,155],[340,55,540,155],[140,155,70,250],[140,155,210,250],[340,155,340,250],[540,155,470,250],[540,155,610,250]].map(([x1,y1,x2,y2],i)=>(
-                  <line key={i} x1={x1} y1={y1} x2={x2} y2={y2} stroke={COLORS.border} strokeWidth="1.5" strokeDasharray="4 3"/>
+                <defs>
+                  <filter id="gw">
+                    <feGaussianBlur stdDeviation="2.5" result="b" />
+                    <feMerge>
+                      <feMergeNode in="b" />
+                      <feMergeNode in="SourceGraphic" />
+                    </feMerge>
+                  </filter>
+                </defs>
+                {[
+                  [340, 55, 140, 155], [340, 55, 340, 155], [340, 55, 540, 155],
+                  [140, 155, 70, 250], [140, 155, 210, 250],
+                  [340, 155, 340, 250],
+                  [540, 155, 470, 250], [540, 155, 610, 250],
+                ].map(([x1, y1, x2, y2], i) => (
+                  <line key={i} x1={x1} y1={y1} x2={x2} y2={y2} stroke={COLORS.border} strokeWidth="1.5" strokeDasharray="4 3" />
                 ))}
                 {[
-                  {x:340,y:55, label:'ORIGINAL', sub:'ISL Official', color:COLORS.greenLight,r:26},
-                  {x:140,y:155,label:'TELEGRAM', sub:'IPL Leaks',   color:'#3b82f6',r:20},
-                  {x:340,y:155,label:'YOUTUBE',  sub:'@highlights', color:'#ef4444',r:20},
-                  {x:540,y:155,label:'INSTAGRAM',sub:'@reels',      color:'#ec4899',r:20},
-                  {x:70, y:250,label:'WA GROUP', sub:'500 views',   color:COLORS.amberLight,r:14},
-                  {x:210,y:250,label:'REDDIT',   sub:'r/cricket',   color:'#f97316',r:14},
-                  {x:340,y:250,label:'TWITTER',  sub:'@fan',        color:'#38bdf8',r:14},
-                  {x:470,y:250,label:'TIKTOK',   sub:'viral',       color:'#ef4444',r:14},
-                  {x:610,y:250,label:'YOUTUBE',  sub:'mirror',      color:'#ef4444',r:14},
-                ].map((n,i)=>(
+                  { x: 340, y: 55, label: 'ORIGINAL', sub: 'ISL Official', color: COLORS.greenLight, r: 26 },
+                  { x: 140, y: 155, label: 'TELEGRAM', sub: 'IPL Leaks', color: '#3b82f6', r: 20 },
+                  { x: 340, y: 155, label: 'YOUTUBE', sub: '@highlights', color: '#ef4444', r: 20 },
+                  { x: 540, y: 155, label: 'INSTAGRAM', sub: '@reels', color: '#ec4899', r: 20 },
+                  { x: 70, y: 250, label: 'WA GROUP', sub: '500 views', color: COLORS.amberLight, r: 14 },
+                  { x: 210, y: 250, label: 'REDDIT', sub: 'r/cricket', color: '#f97316', r: 14 },
+                  { x: 340, y: 250, label: 'TWITTER', sub: '@fan', color: '#38bdf8', r: 14 },
+                  { x: 470, y: 250, label: 'TIKTOK', sub: 'viral', color: '#ef4444', r: 14 },
+                  { x: 610, y: 250, label: 'YOUTUBE', sub: 'mirror', color: '#ef4444', r: 14 },
+                ].map((n, i) => (
                   <g key={i} filter="url(#gw)">
-                    <circle cx={n.x} cy={n.y} r={n.r+5} fill={n.color+'18'} stroke={n.color+'50'} strokeWidth="1"/>
-                    <circle cx={n.x} cy={n.y} r={n.r}   fill={n.color+'22'} stroke={n.color}      strokeWidth="1.5"/>
-                    <text x={n.x} y={n.y-3} textAnchor="middle" fill={n.color}    fontSize="7.5" fontWeight="bold">{n.label}</text>
-                    <text x={n.x} y={n.y+8} textAnchor="middle" fill={COLORS.muted} fontSize="6.5">{n.sub}</text>
+                    <circle cx={n.x} cy={n.y} r={n.r + 5} fill={n.color + '18'} stroke={n.color + '50'} strokeWidth="1" />
+                    <circle cx={n.x} cy={n.y} r={n.r} fill={n.color + '22'} stroke={n.color} strokeWidth="1.5" />
+                    <text x={n.x} y={n.y - 3} textAnchor="middle" fill={n.color} fontSize="7.5" fontWeight="bold">{n.label}</text>
+                    <text x={n.x} y={n.y + 8} textAnchor="middle" fill={COLORS.muted} fontSize="6.5">{n.sub}</text>
                   </g>
                 ))}
               </svg>
@@ -843,8 +1446,13 @@ export default function App() {
 
       </main>
 
-      {dmcaOpen && result && (
-        <DmcaModal result={result} origFile={origFile} suspFile={suspFile} onClose={() => setDmcaOpen(false)} />
+      {dmcaOpen && compareResult && (
+        <DmcaModal
+          result={compareResult}
+          origFile={origFile}
+          suspFile={suspFile}
+          onClose={() => setDmcaOpen(false)}
+        />
       )}
     </div>
   );
