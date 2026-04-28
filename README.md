@@ -10,13 +10,13 @@ Indian sports piracy causes ₹3,200 crore in losses per year. When Kohli hits a
 
 ## Our Solution
 Sports Guardian is an affordable AI-powered piracy detection system that:
-- Embeds invisible watermarks into official video content
+- creates a unique mathematical "signature" of the visual content (fingerprinting). 
 - Detects stolen copies across YouTube, Instagram, Telegram, Reddit, Twitter in under 30 seconds
-- Maps the full spread lineage — showing exactly who leaked it and who reposted from whom
+- Maps the full spread lineage — showing exactly where it was leaked,who is responsible for it and who reposted from whom
 - Auto-generates DMCA takedown notices with one click
 
 ## How It Works
-1. Rights holder uploads official clip → system embeds invisible watermark + generates perceptual fingerprint
+1. Rights holder uploads official clip → generates perceptual fingerprint
 2. Crawler continuously scans social platforms for matching content using 3-layer detection
 3. Stolen copy detected in ~8 seconds → alert fires with full lineage graph
 4. One click generates and sends DMCA takedown notice
