@@ -103,7 +103,7 @@ function extractSingleFrame(file) {
 //  Returns the JSON result from Flask
 // ─────────────────────────────────────────────
 
-async function callFlaskCompare(origBlob, suspBlob, origName, suspName) {
+async function callFlaskCompare(origBlob, suspBlob, origName = 'original.jpg', suspName = 'suspect.jpg') {
   const form = new FormData();
   form.append('file_a', origBlob, origName);
   form.append('file_b', suspBlob, suspName);
@@ -118,7 +118,36 @@ async function callFlaskCompare(origBlob, suspBlob, origName, suspName) {
     throw new Error(`Flask error ${response.status}: ${text}`);
   }
 
-  return await response.json();
+  const json = await response.json();
+
+  // Flask wraps everything inside json.data
+  const d = json.data;
+
+  if (!d) {
+    throw new Error('Flask returned empty data');
+  }
+
+  // Map Flask field names → what the UI expects
+  return {
+    overall:          d.confidence         ?? 0,
+    status:           d.verdict            ?? 'CLEAN',
+    reason:           `ORB: ${d.orb_score ?? 0}% | Crop: ${d.crop_score ?? 0}% | Hash: ${d.hash_score ?? 0}%`,
+
+    // Score meters
+    orb_score:        d.orb_score          ?? 0,
+    crop_score:       d.crop_score         ?? 0,
+    pSim:             d.hash_score         ?? 0,
+
+    // Detection cards
+    crop_detected:    d.detection_details?.crop?.crop_detected    ?? false,
+    mirror_detected:  d.mirror_detected                           ?? false,
+    mirror_score:     d.detection_details?.mirror?.score          ?? 0,
+    rotation_detected: d.rotation_detected                        ?? false,
+    rotation_angle:   d.best_angle                                ?? 0,
+
+    // Raw label
+    label:            `${origName} vs ${suspName}`,
+  };
 }
 
 // ─────────────────────────────────────────────
